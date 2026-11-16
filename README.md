@@ -1,4 +1,4 @@
-![CooP Sekiro](media/banner.jpg)
+(Page is WIP, this mod is forked from @Tihvert so a lot of this contains their well written wording. I'll update it to be more personalised as I settle in to the mod. This is my first time modding (I do have a degree in Game Design) so I'm a little lost with it all but I'll get the hang of it)
 
 # CooP Sekiro
 
@@ -6,9 +6,7 @@ By **xCløuD** — forked from *Sekiro Together* by **Tihvert**.
 
 Online co-op mod for **Sekiro: Shadows Die Twice** with simple drag-and-drop installation and a dedicated launcher (`coop_sekiro_launcher.exe`). You and your friends (2-6 players) play in the same world, fight the same enemies and bosses, and the session keeps going when someone dies, warps, or hits a loading screen.
 
-Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through `coop_sekiro_launcher.exe` starts CooP Sekiro with its own separate save file (`S0000.coop.sl2`). Neither clashes.
-
-![two players at the Fountainhead Palace overlook](media/overlook.jpg)
+Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through `coop_sekiro_launcher.exe` starts CooP Sekiro with its own separate save file (`S0000.co2`). Neither clashes.
 
 ## Heads up, read this first
 
@@ -17,8 +15,6 @@ Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through
 **Only play with people you trust.** Sekiro never got the netcode security patches the other FromSoftware titles got, and this mod runs the game's own online code between players. Co-op stays off until you set a password, and only people with the same password can join you.
 
 This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now maintained by **xCløuD** cleanly structured without an external `me3` dependency.
-
-![co-op settings in the game's own options menu](media/coop-settings.jpg)
 
 ## What works
 
@@ -34,21 +30,15 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now ma
 - Deathblow lock so two people can't deathblow the same enemy.
 - Party HP bars.
 - CooP Sekiro Settings page inside the game's own Options menu.
-- Co-op uses its own save file (`S0000.coop.sl2`), automatically copied from your vanilla save the first time without touching `S0000.sl2`. Auto backups every 10 min.
+- Co-op uses its own save file (`S0000.co2`), without touching `S0000.sl2`. Auto backups every 10 min.
 
-## What's broken / not done (inherited from upstream)
+## What's broken / not done (inherited from upstream, have attempted to get these fixed but needs further testing before I can cross these off)
 
-- Enemies or bosses can desync between players now and then.
-- Levers, lifts and breakables aren't synced. Doors are, sort of.
-- Resurrect sometimes isn't offered when it should be (a fix is in, not yet verified live).
-- Spectate sometimes goes to a black screen.
-- Story phases (Ministry invasion, burning castle, Shura) aren't handled as their own thing.
-- Lag / stutter spikes, mostly on the host.
-- Puppeteer Ninjutsu puppets used to die instantly (a fix is in, not yet verified live).
-- 3-6 players never tested live.
-- Some flags can get lost, so the own-world restore after co-op can miss some story/NPC stuff.
-- Dragonrot, Bell Demon, Kuro's Charm and cutscenes aren't handled specially.
-- The game can crash. Not often, but it happens.
+- Enemies or bosses can desync now and then.
+- Levers, lifts and breakables are not synced; doors only partially.
+- Resurrect / spectate camera edge cases are still being hardened.
+- Story phases, Dragonrot, Bell Demon and cutscenes aren't handled specially yet.
+- Host stutter spikes can occur during area transitions / heavy combat; 3-6 players not tested live yet.
 
 ## How to install
 
@@ -74,8 +64,7 @@ Steps:
    - **Severed Thread**: leave co-op
 3. Host uses the Bell, everyone else uses the Charm. The top left corner shows connection status.
 4. To stop, everyone uses the Severed Thread (joiners first, host last), then Quit Game from the menu or Alt+F4. Quit Game is greyed out while you're still in co-op, that's on purpose. Don't close the game from Task Manager unless it's frozen, so `log.txt` can record clean vs crash exits.
-
-![the co-op items](media/kindred-items.jpg)
+   
 
 ### Connecting
 
@@ -111,7 +100,7 @@ Either edit `CoopSekiro\sekiro_coop_settings.ini` (it gets re-read every couple 
 
 ### Saves
 
-CooP Sekiro uses `S0000.coop.sl2`, automatically copied from your normal `S0000.sl2` on first launch if missing. Your normal `S0000.sl2` isn't touched. Backups go to `%LOCALAPPDATA%\sekiro-coop\save-backups\` (10 newest kept). Still, keep your own backup before playing.
+CooP Sekiro uses `S0000.co2`. Your normal `S0000.sl2` isn't touched. Backups go to `%LOCALAPPDATA%\sekiro-coop\save-backups\` (10 newest kept). Still, keep your own backup before playing.
 
 ## Linux / Steam Deck
 
