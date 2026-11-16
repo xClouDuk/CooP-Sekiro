@@ -1,0 +1,10 @@
+[package]
+name = "coop-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone drag-and-drop launcher for CooP Sekiro"
+
+[[bin]]
+name = "coop_sekiro_launcher"
+path = "src/main.rs"
