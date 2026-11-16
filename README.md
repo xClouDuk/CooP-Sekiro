@@ -1,5 +1,9 @@
 (Page is WIP, this mod is forked from @Tihvert so a lot of this contains their well written wording. I'll update it to be more personalised as I settle in to the mod. This is my first time modding (I do have a degree in Game Design) so I'm a little lost with it all but I'll get the hang of it))
 
+# Discord
+I've made a Discord, for easier communication as it's something I'm more used to while I get used to all of this, it can also be used to provide logs and find other players 😅
+https://discord.gg/ysVHSgpdBu
+
 # CooP Sekiro
 
 By **xCløuD** — forked from *Sekiro Together* by **Tihvert**.
