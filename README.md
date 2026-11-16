@@ -1,4 +1,4 @@
-(Page is WIP, this mod is forked from @Tihvert so a lot of this contains their well written wording. I'll update it to be more personalised as I settle in to the mod. This is my first time modding (I do have a degree in Game Design) so I'm a little lost with it all but I'll get the hang of it)
+(Page is WIP, this mod is forked from @Tihvert so a lot of this contains their well written wording. I'll update it to be more personalised as I settle in to the mod. This is my first time modding (I do have a degree in Game Design) so I'm a little lost with it all but I'll get the hang of it))
 
 # CooP Sekiro
 
@@ -14,7 +14,7 @@ Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through
 
 **Only play with people you trust.** Sekiro never got the netcode security patches the other FromSoftware titles got, and this mod runs the game's own online code between players. Co-op stays off until you set a password, and only people with the same password can join you.
 
-This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now maintained by **xCløuD** cleanly structured without an external `me3` dependency.
+This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, with CooP Sekiro being maintained by **xCløuD**, cleanly structured without an external `me3` dependency.
 
 ## What works
 
@@ -39,6 +39,7 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now ma
 - Resurrect / spectate camera edge cases are still being hardened.
 - Story phases, Dragonrot, Bell Demon and cutscenes aren't handled specially yet.
 - Host stutter spikes can occur during area transitions / heavy combat; 3-6 players not tested live yet.
+- Ultrawide support (Will hopefully get this working soon, I haven't even begun to look at this yet though)
 
 ## How to install
 
