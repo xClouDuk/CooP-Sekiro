@@ -8,8 +8,6 @@ Online co-op mod for **Sekiro: Shadows Die Twice** with simple drag-and-drop ins
 
 Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through `coop_sekiro_launcher.exe` starts CooP Sekiro with its own separate save file (`S0000.coop.sl2`). Neither clashes.
 
-![two players at the Fountainhead Palace overlook](media/overlook.jpg)
-
 ## Heads up, read this first
 
 **The mod is still a beta.** Back up your saves before playing.
@@ -17,8 +15,6 @@ Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through
 **Only play with people you trust.** Sekiro never got the netcode security patches the other FromSoftware titles got, and this mod runs the game's own online code between players. Co-op stays off until you set a password, and only people with the same password can join you.
 
 This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now maintained by **xCløuD** cleanly structured without an external `me3` dependency.
-
-![co-op settings in the game's own options menu](media/coop-settings.jpg)
 
 ## What works
 
@@ -74,8 +70,7 @@ Steps:
    - **Severed Thread**: leave co-op
 3. Host uses the Bell, everyone else uses the Charm. The top left corner shows connection status.
 4. To stop, everyone uses the Severed Thread (joiners first, host last), then Quit Game from the menu or Alt+F4. Quit Game is greyed out while you're still in co-op, that's on purpose. Don't close the game from Task Manager unless it's frozen, so `log.txt` can record clean vs crash exits.
-
-![the co-op items](media/kindred-items.jpg)
+   
 
 ### Connecting
 
