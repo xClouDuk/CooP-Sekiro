@@ -32,19 +32,13 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now ma
 - CooP Sekiro Settings page inside the game's own Options menu.
 - Co-op uses its own save file (`S0000.coop.sl2`), automatically copied from your vanilla save the first time without touching `S0000.sl2`. Auto backups every 10 min.
 
-## What's broken / not done (inherited from upstream)
+## What's broken / not done (inherited from upstream, have attempted to get these fixed but needs further testing before I can cross these off)
 
-- Enemies or bosses can desync between players now and then.
-- Levers, lifts and breakables aren't synced. Doors are, sort of.
-- Resurrect sometimes isn't offered when it should be (a fix is in, not yet verified live).
-- Spectate sometimes goes to a black screen.
-- Story phases (Ministry invasion, burning castle, Shura) aren't handled as their own thing.
-- Lag / stutter spikes, mostly on the host.
-- Puppeteer Ninjutsu puppets used to die instantly (a fix is in, not yet verified live).
-- 3-6 players never tested live.
-- Some flags can get lost, so the own-world restore after co-op can miss some story/NPC stuff.
-- Dragonrot, Bell Demon, Kuro's Charm and cutscenes aren't handled specially.
-- The game can crash. Not often, but it happens.
+- Enemies or bosses can desync now and then.
+- Levers, lifts and breakables are not synced; doors only partially.
+- Resurrect / spectate camera edge cases are still being hardened.
+- Story phases, Dragonrot, Bell Demon and cutscenes aren't handled specially yet.
+- Host stutter spikes can occur during area transitions / heavy combat; 3-6 players not tested live yet.
 
 ## How to install
 
