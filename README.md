@@ -1,4 +1,4 @@
-![CooP Sekiro](media/banner.jpg)
+(Page is WIP, this mod is forked from @Tihvert so a lot of this contains their well written wording. I'll update it to be more personalised as I settle in to the mod. This is my first time modding (I do have a degree in Game Design) so I'm a little lost with it all but I'll get the hang of it)
 
 # CooP Sekiro
 
@@ -6,7 +6,7 @@ By **xCløuD** — forked from *Sekiro Together* by **Tihvert**.
 
 Online co-op mod for **Sekiro: Shadows Die Twice** with simple drag-and-drop installation and a dedicated launcher (`coop_sekiro_launcher.exe`). You and your friends (2-6 players) play in the same world, fight the same enemies and bosses, and the session keeps going when someone dies, warps, or hits a loading screen.
 
-Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through `coop_sekiro_launcher.exe` starts CooP Sekiro with its own separate save file (`S0000.coop.sl2`). Neither clashes.
+Launching Sekiro through Steam starts vanilla unmodded Sekiro; launching through `coop_sekiro_launcher.exe` starts CooP Sekiro with its own separate save file (`S0000.co2`). Neither clashes.
 
 ## Heads up, read this first
 
@@ -30,7 +30,7 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, now ma
 - Deathblow lock so two people can't deathblow the same enemy.
 - Party HP bars.
 - CooP Sekiro Settings page inside the game's own Options menu.
-- Co-op uses its own save file (`S0000.coop.sl2`), automatically copied from your vanilla save the first time without touching `S0000.sl2`. Auto backups every 10 min.
+- Co-op uses its own save file (`S0000.co2`), without touching `S0000.sl2`. Auto backups every 10 min.
 
 ## What's broken / not done (inherited from upstream, have attempted to get these fixed but needs further testing before I can cross these off)
 
@@ -100,7 +100,7 @@ Either edit `CoopSekiro\sekiro_coop_settings.ini` (it gets re-read every couple 
 
 ### Saves
 
-CooP Sekiro uses `S0000.coop.sl2`, automatically copied from your normal `S0000.sl2` on first launch if missing. Your normal `S0000.sl2` isn't touched. Backups go to `%LOCALAPPDATA%\sekiro-coop\save-backups\` (10 newest kept). Still, keep your own backup before playing.
+CooP Sekiro uses `S0000.co2`. Your normal `S0000.sl2` isn't touched. Backups go to `%LOCALAPPDATA%\sekiro-coop\save-backups\` (10 newest kept). Still, keep your own backup before playing.
 
 ## Linux / Steam Deck
 
