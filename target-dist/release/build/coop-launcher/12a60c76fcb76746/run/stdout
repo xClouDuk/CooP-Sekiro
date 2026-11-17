@@ -1,2 +1,0 @@
-cargo:rerun-if-changed=../coop-dll/src/ui.rs
-cargo:rustc-link-arg-bin=coop_sekiro_launcher=E:\Modded games\Sekiro\CooP-Sekiro\target-dist\release\build\coop-launcher/12a60c76fcb76746\out\launcher.res

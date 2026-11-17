@@ -1,3 +1,0 @@
-cargo:rustc-env=COOP_GIT_HASH=b5b0c08ad6
-cargo:rustc-env=COOP_BUILD_EPOCH=1794918394
-cargo:rustc-link-arg-cdylib=E:\Modded games\Sekiro\CooP-Sekiro\target-public\release\build\sekiro_coop/8a63becc26f4c350\out\version.res

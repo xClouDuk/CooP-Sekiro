@@ -1,3 +1,6 @@
+/target
+/target-public
+/target-dist
 *.zip
 *.log
 
