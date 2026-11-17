@@ -417,6 +417,7 @@ impl Puppet {
         // here); new network keys reconnect.
         settings::tick();
         fps::apply();
+        crate::ultrawide::apply();
         let cmd = ui::take_commands();
         let f5 = self.f5.pressed(VK_F5) && keys;
         let f6 = self.f6.pressed(VK_F6) && keys;

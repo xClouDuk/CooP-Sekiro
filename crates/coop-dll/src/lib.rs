@@ -23,6 +23,7 @@ mod doctor;
 mod dump;
 mod enemies;
 mod fps;
+mod ultrawide;
 mod game;
 mod ghost;
 mod gpuguard;
@@ -161,6 +162,10 @@ pub unsafe extern "C" fn DllMain(hmodule: usize, reason: u32, reserved: usize) -
 }
 
 fn init(hmodule: usize) {
+    // Load settings early so ultrawide patches apply before Sekiro reads GraphicsConfig.xml
+    // and initializes its viewport/swapchain during boot.
+    settings::init();
+    let _ = panic::catch_unwind(ultrawide::install_early);
     // 1.0-beta gave up on the first NotFound (too early on some PCs); it is retried now.
     let waited = std::time::Instant::now();
     let task_imp = match SprjTaskImp::wait_for_instance(Duration::MAX) {
@@ -177,8 +182,6 @@ fn init(hmodule: usize) {
         "coop: task system ready after {} ms, registering frame task",
         waited.elapsed().as_millis()
     ));
-    // The settings file first: fps and observe read it when they install.
-    settings::init();
     // Re-check IAT once the game has unpacked and reached the task loop.
     let _ = panic::catch_unwind(savefile::reinstall_iat);
     // The previous run's log says whether it ended normally (log.rs, read before the header wrote).
@@ -218,6 +221,8 @@ fn init(hmodule: usize) {
     // v8.60: the owner's type-5 HP does not kill a Puppeteer puppet here (puppetguard.rs).
     puppetguard::install();
     fps::install();
+    // Ultrawide (21:9 / 32:9): clamp, fov and added resolutions (ultrawide.rs).
+    let _ = panic::catch_unwind(ultrawide::install);
     // The material constant-buffer over-read behind the nvwgf2umx.dll crash (gpuguard.rs).
     gpuguard::install(settings::gpu_guard_at_start());
     #[cfg(feature = "testsync")]

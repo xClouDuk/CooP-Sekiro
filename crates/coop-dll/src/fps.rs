@@ -44,7 +44,7 @@ unsafe extern "system" {
 }
 
 /// The exe's `.text` section as a slice (from the PE headers).
-fn text() -> Option<(usize, &'static [u8])> {
+pub(crate) fn text() -> Option<(usize, &'static [u8])> {
     let base = crate::game::module_base();
     unsafe {
         let pe = base + *((base + 0x3C) as *const u32) as usize;
@@ -65,15 +65,15 @@ fn text() -> Option<(usize, &'static [u8])> {
 }
 
 /// First match of a pattern (`None` = wildcard).
-fn find(hay: &[u8], pat: &[Option<u8>]) -> Option<usize> {
+pub(crate) fn find(hay: &[u8], pat: &[Option<u8>]) -> Option<usize> {
     hay.windows(pat.len()).position(|w| w.iter().zip(pat).all(|(b, p)| p.is_none_or(|p| *b == p)))
 }
 
-fn pattern(s: &str) -> Vec<Option<u8>> {
+pub(crate) fn pattern(s: &str) -> Vec<Option<u8>> {
     s.split_whitespace().map(|t| if t == "??" { None } else { u8::from_str_radix(t, 16).ok() }).collect()
 }
 
-fn write_code(addr: usize, bytes: &[u8]) -> bool {
+pub(crate) fn write_code(addr: usize, bytes: &[u8]) -> bool {
     let mut old = 0u32;
     unsafe {
         if VirtualProtect(addr as *mut _, bytes.len(), 0x40, &mut old) == 0 {
