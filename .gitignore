@@ -1,8 +1,8 @@
-/target
-/target-public
-/target-dist
-*.zip
-*.log
+# /target
+# /target-public
+# /target-dist
+# *.zip
+# *.log
 
 # Secrets and local junk
 # .env
