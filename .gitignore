@@ -1,21 +1,15 @@
-/target
-/target-public
-/target-dist
-/dist
-/profiles
-/test-builds
 *.zip
 *.log
 
 # Secrets and local junk
-.env
-.env.*
-*.env
-*.pem
-*.key
-*.p12
-*.pfx
-secrets/
-__pycache__/
-*.pyc
-work/
+# .env
+# .env.*
+# *.env
+# *.pem
+# *.key
+# *.p12
+# *.pfx
+# secrets/
+# __pycache__/
+# *.pyc
+# work/

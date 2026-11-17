@@ -1,0 +1,10 @@
+E:\Modded games\Sekiro\CooP-Sekiro\target-public\release\build\windows-threading/f7895f0ce6d5b13b\out\windows_threading-f7895f0ce6d5b13b.d: C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\lib.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\bindings.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\pool.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\../readme.md
+
+E:\Modded games\Sekiro\CooP-Sekiro\target-public\release\build\windows-threading/f7895f0ce6d5b13b\out\libwindows_threading-f7895f0ce6d5b13b.rlib: C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\lib.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\bindings.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\pool.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\../readme.md
+
+E:\Modded games\Sekiro\CooP-Sekiro\target-public\release\build\windows-threading/f7895f0ce6d5b13b\out\libwindows_threading-f7895f0ce6d5b13b.rmeta: C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\lib.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\bindings.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\pool.rs C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\../readme.md
+
+C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\lib.rs:
+C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\bindings.rs:
+C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\pool.rs:
+C:\Users\r3d3m\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows-threading-0.2.1\src\../readme.md:

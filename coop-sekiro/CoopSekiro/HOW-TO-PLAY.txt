@@ -1,0 +1,90 @@
+COOP SEKIRO 1.3.1 beta - quick guide
+=====================================
+By xCløuD (forked from Sekiro Together by Tihvert)
+
+Beta, still buggy. Back up your saves before playing.
+
+YOU NEED
+- Sekiro on Steam, version 1.06 (normal, unmodded)
+- Windows (or Linux / Steam Deck with Proton; see LINUX / STEAM DECK below)
+- No mod loader (me3) needed!
+
+INSTALL (DRAG AND DROP)
+1. Got Sekiro Online or other online mods? Delete dinput8.dll, steam_api64.org,
+   cream_api.ini and SekiroOnlineFont.ttf from the game folder, then
+   Steam > Sekiro > Properties > Installed Files > Verify integrity.
+2. Extract/drag `coop_sekiro_launcher.exe` and the `CoopSekiro` folder
+   directly into your Sekiro game folder (the folder containing sekiro.exe).
+   - Launching Sekiro from Steam starts the normal unmodded game.
+   - Running `coop_sekiro_launcher.exe` launches CooP Sekiro.
+   Neither interferes with the other.
+3. Open `CoopSekiro\sekiro_coop_settings.ini` and set the SAME password for
+   everyone (`password = ...`). Co-op is off while it is empty.
+4. Everyone needs the exact same mod version.
+
+PLAYING
+1. Make sure Steam is open, run `coop_sekiro_launcher.exe`, and load your save.
+2. After the intro (Genichiro beats you, you wake up at Dilapidated Temple)
+   rest at the temple idol. You get:
+   - Kindred Bell   = open your world (host)
+   - Kindred Charm  = join the host
+   - Severed Thread = leave co-op
+3. Host uses the Bell, others use the Charm. Status is in the top left corner.
+4. Settings: `CoopSekiro\sekiro_coop_settings.ini` or Options > CooP Sekiro Settings in game.
+
+STOPPING
+1. Everyone uses the Severed Thread, joiners first and host last.
+   Joiners get a loading screen and are back in their own world.
+2. Then Quit Game from the menu, or Alt+F4.
+Quit Game is greyed out while you're still in co-op, that's on purpose.
+Don't close the game from Task Manager unless it's frozen (so log.txt can
+record whether the game exited cleanly).
+
+CONNECTION
+Steam by default, falls back to direct UDP after 15 s. Steam lobbies only work
+when Sekiro is owned on that Steam account and Steam is online; otherwise use UDP.
+
+DIRECT UDP (in [ADVANCED] in CoopSekiro\sekiro_coop_settings.ini)
+Host:
+1. transport = udp (or auto, then it switches after 15 s).
+2. Load your save and use the Kindred Bell. The address only shows up after
+   the Bell, not at game start.
+3. The mod tries to open port 28100 UDP on your router (UPnP). If it works,
+   the top left shows "join code 1.2.3.4:28100" and the same code is saved
+   to CoopSekiro\udp_join_code.txt (deleted when the session closes).
+4. No udp_join_code.txt and "UPnP failed" in the top left? Forward UDP 28100
+   to your PC by hand in the router, and get your public IP from a site like
+   whatismyip.com. Your join code is <that ip>:28100.
+5. Send the join code to everyone joining.
+Joiners:
+1. transport = udp and udp_host_address = <host's join code>,
+   e.g. udp_host_address = 1.2.3.4:28100
+2. Same password as the host.
+3. Load your save and use the Kindred Charm.
+Only the host needs an open port. All joiners use the same address.
+Can't open ports? A virtual LAN (Radmin VPN, ZeroTier, Tailscale) works:
+everyone joins the same network and joiners use the host's VPN IP as
+udp_host_address. No port forwarding needed then.
+
+SAVES
+CooP Sekiro uses its own completely isolated save `S0000.co2` (starts clean, never
+copies or modifies your vanilla `S0000.sl2`).
+Backups: %LOCALAPPDATA%\sekiro-coop\save-backups\
+
+BUGS
+Log: %LOCALAPPDATA%\sekiro-coop\log.txt
+Press F11 (or Back/Share on a pad) when a bug happens, it marks the log.
+
+LINUX / STEAM DECK
+Untested directly on Linux, runs through Proton like other standalone .exe launchers:
+1. Start Sekiro once from Steam normally, quit at the main menu.
+2. Copy `coop_sekiro_launcher.exe` and `CoopSekiro\` into your Sekiro game folder.
+3. Add `coop_sekiro_launcher.exe` to Steam as a Non-Steam Game, enable Proton
+   in Compatibility, and set Launch Options so it shares Sekiro's prefix:
+   STEAM_COMPAT_DATA_PATH="$HOME/.local/share/Steam/steamapps/compatdata/814380" %command%
+   (Or run `protontricks-launch --appid 814380 coop_sekiro_launcher.exe`.)
+Files inside Sekiro's Proton prefix:
+  ~/.local/share/Steam/steamapps/compatdata/814380/pfx/drive_c/users/steamuser/
+    AppData/Local/sekiro-coop/   log.txt, save-backups
+    AppData/Roaming/Sekiro/      saves (S0000.sl2 and S0000.coop.sl2)
+See docs/LINUX.md for Flatpak, Steam Deck, and firewall notes.
