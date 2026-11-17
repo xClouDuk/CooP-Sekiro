@@ -24,6 +24,7 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, with C
 
 - Simple drag-and-drop install (`coop_sekiro_launcher.exe` + `CoopSekiro\` folder) with separate vanilla and co-op launches.
 - Ultrawide support
+- 120FPS support, toggleable within the CooP Sekiro settings in game. (Turn off Vsync if you're stuck at 60fps)
 - 2-6 players, one host and everyone else joins the host (2 players extensively tested; 3+ only in unit tests so far).
 - Other players show up as real player characters with name, ping and their gear.
 - Enemies and bosses synced (carries the game's own online netcode over CooP Sekiro's connection).
