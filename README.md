@@ -23,6 +23,7 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, with C
 ## What works
 
 - Simple drag-and-drop install (`coop_sekiro_launcher.exe` + `CoopSekiro\` folder) with separate vanilla and co-op launches.
+- Ultrawide support
 - 2-6 players, one host and everyone else joins the host (2 players extensively tested; 3+ only in unit tests so far).
 - Other players show up as real player characters with name, ping and their gear.
 - Enemies and bosses synced (carries the game's own online netcode over CooP Sekiro's connection).
@@ -43,7 +44,6 @@ This repository is a fork of **Tihvert**'s open-source *Sekiro Together*, with C
 - Resurrect / spectate camera edge cases are still being hardened.
 - Story phases, Dragonrot, Bell Demon and cutscenes aren't handled specially yet.
 - Host stutter spikes can occur during area transitions / heavy combat; 3-6 players not tested live yet.
-- Ultrawide support (Will hopefully get this working soon, I haven't even begun to look at this yet though)
 
 ## How to install
 
