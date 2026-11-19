@@ -61,6 +61,10 @@ Steps:
 3. Open `CoopSekiro\sekiro_coop_settings.ini` and set the **same password** for everyone (`password = ...`). Co-op stays off while it's empty.
 4. Everyone needs the exact same mod version.
 
+Your Sekiro directory should look something like this;
+<img width="780" height="837" alt="image" src="https://github.com/user-attachments/assets/6cfd3420-e4ae-4396-90a3-3cef26008883" />
+
+
 ## How to play
 
 1. Make sure Steam is open, double-click `coop_sekiro_launcher.exe`, and load your save. (To play vanilla solo without mods, launch Sekiro normally from Steam.)
