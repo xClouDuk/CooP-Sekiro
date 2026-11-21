@@ -158,7 +158,7 @@ pub fn map_udp_port(port: u16, description: &str, lease_secs: u32) -> Result<Map
 /// UDP socket only picks the route). With VPN/virtual adapters present a socket
 /// bound to 0.0.0.0 may send the multicast out of the wrong one, which is a
 /// likely cause of "No UPnP router found" on a router that has UPnP on (2026-10-22).
-fn primary_local_ip() -> Option<Ipv4Addr> {
+pub fn primary_local_ip() -> Option<Ipv4Addr> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("8.8.8.8:80").ok()?;
     match s.local_addr().ok()?.ip() {

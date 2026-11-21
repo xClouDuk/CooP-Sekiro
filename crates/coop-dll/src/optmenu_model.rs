@@ -91,8 +91,11 @@ const SPEC_ORBIT: &[&str] = &["Fixed behind player", "Game camera input", "Right
 const HP_POS: &[&str] = &["Above head", "Left list", "Top list"];
 const HP_CONTENT: &[&str] = &["Name and bar", "Bar only", "Bar and numbers"];
 const PAD_BTN: &[&str] = &["Back", "Start", "L3", "R3", "None"];
+const TRANSPORT: &[&str] = &["Auto (Steam / UDP)", "Steam", "Direct UDP"];
 
-static ROWS: [RowDef; 40] = [
+static ROWS: [RowDef; 42] = [
+    rn(41, "transport", "Connection mode", "Auto tries Steam then UDP; Steam or Direct UDP forces one.", Choice(TRANSPORT), HostOffline, &["auto", "steam", "udp"]),
+    r(42, "steam_invites", "Steam invites", "On = private Steam invite lobbies. Off = password-matched lobbies.", OnOff, HostOffline),
     r(1, "enemy_health_scaling", "Enemy health", "Extra enemy health per added player. Host sets it.", Pct, Host),
     r(2, "enemy_posture_scaling", "Enemy posture", "Extra enemy posture per added player. Host sets it.", Pct, Host),
     r(3, "boss_health_scaling", "Boss health", "Extra boss health per added player. Host sets it.", Pct, Host),
@@ -419,6 +422,11 @@ mod tests {
         assert_eq!(ini_update(row("merge_quests"), 2), ("merge_quests", "2".to_owned()));
         assert_eq!(ini_update(row("party_hp_scale"), 10), ("party_hp_scale", "50".to_owned()));
         assert_eq!(ini_update(row("spectate_camera"), 9), ("spectate_camera", "2".to_owned()));
+        assert_eq!(ini_update(row("transport"), 0), ("transport", "auto".to_owned()));
+        assert_eq!(ini_update(row("transport"), 1), ("transport", "steam".to_owned()));
+        assert_eq!(ini_update(row("transport"), 2), ("transport", "udp".to_owned()));
+        assert_eq!(ini_update(row("steam_invites"), 0), ("steam_invites", "0".to_owned()));
+        assert_eq!(ini_update(row("steam_invites"), 1), ("steam_invites", "1".to_owned()));
     }
 
     #[test]

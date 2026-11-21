@@ -569,6 +569,11 @@ impl Session {
         self.start_role(role, Instant::now());
     }
 
+    /// Updates the password (or per-lobby invite token) used to authenticate Hello packets.
+    pub fn set_password(&mut self, password: &str) {
+        self.password_hash = password_hash(password);
+    }
+
     pub fn set_uid(&mut self, uid: u64) {
         self.uid = uid;
     }
@@ -2667,5 +2672,37 @@ mod tests {
         w.pump_without(5, &[2]);
         assert!(w.take(0).contains(&Event::PeerLeft { slot: 1, why: LeaveWhy::Replaced }));
         assert_eq!(w.s[3].me(), 1);
+    }
+
+    #[test]
+    fn set_password_updates_hello_authentication() {
+        let mesh = Mesh::default();
+        let mut host = Session::with_transport(
+            Box::new(Port { me: at(0), mesh: mesh.clone() }),
+            Role::Host,
+            "",
+            "host",
+        );
+        host.set_uid(100);
+        host.set_max_peers(2);
+        host.set_password("inv:token-alpha");
+
+        let mut bad_client = Star::client(&mesh, at(1), 101, "bad", "inv:wrong");
+        let mut good_client = Star::client(&mesh, at(2), 102, "good", "");
+        good_client.set_password("inv:token-alpha");
+
+        let mut now = Instant::now();
+        let mut bad_events = Vec::new();
+        let mut good_events = Vec::new();
+        for _ in 0..10 {
+            bad_events.extend(bad_client.poll(now));
+            good_events.extend(good_client.poll(now));
+            let _ = host.poll(now);
+            now += Duration::from_millis(100);
+        }
+        assert!(bad_events.contains(&Event::Rejected { reason: RejectReason::Password }));
+        assert!(good_events.iter().any(|e| matches!(e, Event::Connected { .. })));
+        assert_eq!(host.peers().len(), 1);
+        assert_eq!(host.peers()[0].1, 102);
     }
 }

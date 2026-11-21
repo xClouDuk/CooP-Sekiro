@@ -329,6 +329,14 @@ fn scan(mem: &impl Mem, base: usize) -> (Vec<Door>, Report) {
     (out, r)
 }
 
+/// Persistent doors (`Class::Door | Class::OneDirDoor`) are synced across peers via
+/// `EV_OBJACT`. Non-door `Class::One` / `OneLoop` ObjActs (treasure chests, the Shinobi
+/// Axe shrine doors, Great Serpent palanquin, repeatable levers) must remain per-player
+/// so opening or looting them never locks another player out.
+pub fn should_sync_objact(is_guard_door: bool, _native_obj_event: bool) -> bool {
+    is_guard_door
+}
+
 fn scan_acts(mem: &impl Mem, base: usize) -> Vec<Act> {
     scan(mem, base).1.acts
 }
@@ -689,6 +697,7 @@ pub fn tick(peer_anims: &[(u8, i32)], in_world_for: Duration) {
         doors();
     }
     // 0b. Detect locally triggered primary ObjAct executions (levers, lifts, doors, chests).
+    let native_obj = crate::nsession::obj_event_active();
     let do_act_scan = with(|s| {
         if s.last_act_scan.is_some_and(|t| now.duration_since(t) < ACT_SCAN_EVERY) {
             false
@@ -703,13 +712,21 @@ pub fn tick(peer_anims: &[(u8, i32)], in_world_for: Duration) {
             s.self_replayed.retain(|_, t| now.duration_since(*t) < SELF_REPLAY_HOLD);
             for act in &acts {
                 let key = (act.slot, act.index);
-                if act.running && !s.running_prev.contains(&key) && !s.self_replayed.contains_key(&key) {
+                if should_sync_objact(act.guard, native_obj)
+                    && act.running
+                    && !s.running_prev.contains(&key)
+                    && !s.self_replayed.contains_key(&key)
+                {
                     if s.outgoing_acts.len() < 128 && !s.outgoing_acts.contains(&key) {
                         s.outgoing_acts.push(key);
                     }
                 }
             }
-            s.running_prev = acts.iter().filter(|a| a.running).map(|a| (a.slot, a.index)).collect();
+            s.running_prev = acts
+                .iter()
+                .filter(|a| a.running && should_sync_objact(a.guard, native_obj))
+                .map(|a| (a.slot, a.index))
+                .collect();
         });
     }
     // 0c. Peer EV_OBJACT events: replay once the peer's state settles.
@@ -734,7 +751,7 @@ pub fn tick(peer_anims: &[(u8, i32)], in_world_for: Duration) {
                 let Some(act) = acts.iter().find(|a| a.slot == slot && a.index == index) else {
                     continue;
                 };
-                if act.running {
+                if act.running || !should_sync_objact(act.guard, native_obj) {
                     continue;
                 }
                 s.self_replayed.insert((slot, index), now);
@@ -1017,5 +1034,13 @@ mod tests {
         let acts = scan_acts(&m, BASE);
         let idxs: Vec<(i32, bool)> = acts.iter().map(|a| (a.index, a.guard)).collect();
         assert_eq!(idxs, vec![(0, false), (1, true), (3, false), (4, true)]);
+    }
+
+    #[test]
+    fn non_door_objact_never_synced() {
+        assert!(should_sync_objact(true, true));
+        assert!(should_sync_objact(true, false));
+        assert!(!should_sync_objact(false, true), "palanquin/chest/lever stays per-player");
+        assert!(!should_sync_objact(false, false), "palanquin/chest/lever stays per-player");
     }
 }

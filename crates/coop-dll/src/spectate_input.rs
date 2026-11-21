@@ -80,9 +80,34 @@ pub fn is_motion(dy: f32, dp: f32) -> bool {
     dy.abs() + dp.abs() > 1e-5
 }
 
+/// If Source A (`ChrCam`) stops moving for this long while engaged (for instance after a brief
+/// twitch during the death collapse), switch automatically to Source B (stick/mouse/arrows).
+pub const A_STALL_AFTER: Duration = Duration::from_millis(500);
+
 /// Source A never moved for `FROZEN_AFTER`: switch to the stick.
 pub fn frozen_after(engaged_for: Duration, moved: bool) -> bool {
     !moved && engaged_for >= FROZEN_AFTER
+}
+
+/// Source A never moved for `FROZEN_AFTER`, or has stopped moving for `A_STALL_AFTER`.
+pub fn source_a_stalled(engaged_for: Duration, since_last_a_move: Option<Duration>) -> bool {
+    match since_last_a_move {
+        None => frozen_after(engaged_for, false),
+        Some(idle) => idle >= A_STALL_AFTER,
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    #[test]
+    fn source_a_stall_detects_both_never_moved_and_frozen_after_twitch() {
+        assert!(!source_a_stalled(FROZEN_AFTER - Duration::from_millis(1), None));
+        assert!(source_a_stalled(FROZEN_AFTER, None));
+        assert!(!source_a_stalled(Duration::from_secs(10), Some(Duration::from_millis(100))));
+        assert!(source_a_stalled(Duration::from_secs(10), Some(A_STALL_AFTER)));
+    }
 }
 
 /// Raw thumb value -> -1..1 with the dead zone removed (and the rest rescaled).
@@ -194,6 +219,7 @@ impl Flick {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> *mut c_void;
     fn LoadLibraryW(name: *const u16) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     fn GetCurrentProcessId() -> u32;
@@ -222,24 +248,31 @@ struct XState {
 
 type XInputGetState = unsafe extern "system" fn(u32, *mut XState) -> u32;
 
-/// `XInputGetState` of xinput1_4.dll (fallback xinput9_1_0.dll), looked up once.
-fn xinput() -> Option<XInputGetState> {
-    static F: OnceLock<usize> = OnceLock::new();
-    let addr = *F.get_or_init(|| {
-        for dll in ["xinput1_4.dll", "xinput9_1_0.dll"] {
-            let w: Vec<u16> = dll.encode_utf16().chain(std::iter::once(0)).collect();
-            let m = unsafe { LoadLibraryW(w.as_ptr()) };
-            if m.is_null() {
-                continue;
+/// `XInputGetState` pointers across XInput DLLs, checking already-loaded modules first
+/// (`xinput1_3.dll` is imported by Sekiro and hooked by Steam Input for DS4/controller emulation).
+fn xinput_fns() -> &'static [usize] {
+    static F: OnceLock<Vec<usize>> = OnceLock::new();
+    F.get_or_init(|| {
+        const DLLS: [&str; 3] = ["xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"];
+        let mut out = Vec::new();
+        for load in [false, true] {
+            for dll in DLLS {
+                let w: Vec<u16> = dll.encode_utf16().chain(std::iter::once(0)).collect();
+                let m = unsafe { if load { LoadLibraryW(w.as_ptr()) } else { GetModuleHandleW(w.as_ptr()) } };
+                if m.is_null() {
+                    continue;
+                }
+                let p = unsafe { GetProcAddress(m, c"XInputGetState".as_ptr() as *const u8) } as usize;
+                if p != 0 && !out.contains(&p) {
+                    out.push(p);
+                }
             }
-            let p = unsafe { GetProcAddress(m, c"XInputGetState".as_ptr() as *const u8) } as usize;
-            if p != 0 {
-                return p;
+            if !out.is_empty() {
+                break;
             }
         }
-        0
-    });
-    (addr != 0).then(|| unsafe { std::mem::transmute::<usize, XInputGetState>(addr) })
+        out
+    })
 }
 
 /// The game window has the keyboard focus (our process owns the foreground window).
@@ -270,13 +303,12 @@ pub struct Sample {
 
 #[derive(Default)]
 pub struct Poller {
-    pad_retry_at: Option<Instant>,
     /// Cursor position and time of the previous mouse sample.
     cursor: Option<((i32, i32), Instant)>,
 }
 
 fn key_down(vk: i32) -> bool {
-    (unsafe { GetAsyncKeyState(vk) } as u16) & 0x8000 != 0
+    crate::inputblock::with_mod_poll(|| (unsafe { GetAsyncKeyState(vk) } as u16) & 0x8000 != 0)
 }
 
 impl Poller {
@@ -302,8 +334,9 @@ impl Poller {
         keyboard_look(true, mouse, arrows)
     }
 
-    /// Reads the keyboard / mouse keys `lock_key` and `switch_key` (0 = none) and controller
-    /// 0. Nothing is read while the game window is not focused.
+    /// Reads the keyboard / mouse keys `lock_key` and `switch_key` (0 = none) and the active
+    /// XInput controller across loaded XInput DLLs / user slots 0..3. Nothing is read while
+    /// the game window is not focused.
     pub fn sample(&mut self, lock_key: i32, switch_key: i32, now: Instant) -> Sample {
         if !game_focused() {
             self.cursor = None;
@@ -318,41 +351,51 @@ impl Poller {
         }
         let extra = self.keyboard_mouse(now);
         out.look = extra;
-        if self.pad_retry_at.is_some_and(|t| now < t) {
-            return out;
-        }
-        if let Some(f) = xinput() {
-            let mut st = XState::default();
-            if unsafe { f(0, &mut st) } == 0 {
-                self.pad_retry_at = None;
-                let pad = (stick_axis(st.rx), stick_axis(st.ry));
-                out.stick = Some(pad);
-                out.look = merge_look(pad, extra);
-                out.lock_down |= st.buttons & PAD_R3 != 0;
-                out.next_down |= st.buttons & PAD_RIGHT != 0;
-                out.prev_down |= st.buttons & PAD_LEFT != 0;
-            } else {
-                self.pad_retry_at = Some(now + PAD_RETRY);
-            }
+        if let Some(st) = pad_state() {
+            let pad = (stick_axis(st.rx), stick_axis(st.ry));
+            out.stick = Some(pad);
+            out.look = merge_look(pad, extra);
+            out.lock_down |= st.buttons & PAD_R3 != 0;
+            out.next_down |= st.buttons & PAD_RIGHT != 0;
+            out.prev_down |= st.buttons & PAD_LEFT != 0;
         }
         out
     }
 }
 
-/// One snapshot of an XInput controller: buttons, triggers (0..255) and the right stick
+/// One snapshot of an XInput controller: buttons, triggers (0..255), and both sticks
 /// (raw, -32768..32767; positive Y = up).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct PadState {
     pub buttons: u16,
     pub lt: u8,
     pub rt: u8,
+    pub lx: i16,
+    pub ly: i16,
     pub rx: i16,
     pub ry: i16,
 }
 
-/// State of the first connected XInput controller (user index 0..3), None when none
-/// answers. Cheap enough for once per frame: after a miss it does not ask again for
-/// `PAD_RETRY`. Does not need the game window to be focused. Never panics.
+/// True when `p` shows clear button, trigger, or stick activity.
+pub fn pad_has_input(p: PadState) -> bool {
+    const STICK_ACT: i32 = 10_000;
+    p.buttons != 0
+        || p.lt > 40
+        || p.rt > 40
+        || (p.lx as i32).abs() > STICK_ACT
+        || (p.ly as i32).abs() > STICK_ACT
+        || (p.rx as i32).abs() > STICK_ACT
+        || (p.ry as i32).abs() > STICK_ACT
+}
+
+/// Selects the first slot showing active controller input, else the first connected slot.
+pub fn pick_active_pad(slots: &[PadState]) -> Option<PadState> {
+    slots.iter().copied().find(|&p| pad_has_input(p)).or_else(|| slots.first().copied())
+}
+
+/// State of the active connected XInput controller (user index 0..3 across available XInput
+/// DLLs), None when none answers. Cheap enough for once per frame: after a miss it does not
+/// ask again for `PAD_RETRY`. Does not need the game window to be focused. Never panics.
 pub fn pad_state() -> Option<PadState> {
     use std::sync::Mutex;
     static RETRY_AT: Mutex<Option<Instant>> = Mutex::new(None);
@@ -361,16 +404,36 @@ pub fn pad_state() -> Option<PadState> {
     if retry.is_some_and(|t| now < t) {
         return None;
     }
-    let f = xinput()?;
-    for user in 0..4u32 {
-        let mut st = XState::default();
-        if unsafe { f(user, &mut st) } == 0 {
-            *retry = None;
-            return Some(PadState { buttons: st.buttons, lt: st.lt, rt: st.rt, rx: st.rx, ry: st.ry });
+    let fns = xinput_fns();
+    if fns.is_empty() {
+        *retry = Some(now + PAD_RETRY);
+        return None;
+    }
+    let mut connected = Vec::with_capacity(4);
+    for &addr in fns {
+        let f: XInputGetState = unsafe { std::mem::transmute::<usize, XInputGetState>(addr) };
+        for user in 0..4u32 {
+            let mut st = XState::default();
+            if crate::inputblock::with_mod_poll(|| unsafe { f(user, &mut st) }) == 0 {
+                connected.push(PadState {
+                    buttons: st.buttons,
+                    lt: st.lt,
+                    rt: st.rt,
+                    lx: st.lx,
+                    ly: st.ly,
+                    rx: st.rx,
+                    ry: st.ry,
+                });
+            }
         }
     }
-    *retry = Some(now + PAD_RETRY);
-    None
+    if let Some(best) = pick_active_pad(&connected) {
+        *retry = None;
+        Some(best)
+    } else {
+        *retry = Some(now + PAD_RETRY);
+        None
+    }
 }
 
 /// wButtons of the first connected XInput controller, None when none answers.
@@ -543,5 +606,18 @@ mod tests {
         assert_eq!(f.push(0.1, 0.2), Some(1)); // 0.4 rad = 23 deg within 0.1 s
         assert_eq!(f.push(0.2, -0.5), None); // sleeping
         assert_eq!(f.push(0.7, -0.5), Some(-1));
+    }
+
+    #[test]
+    fn pick_active_pad_prefers_slot_with_input() {
+        assert_eq!(pick_active_pad(&[]), None);
+        let idle = PadState::default();
+        let active_btn = PadState { buttons: 0x1000, ..Default::default() };
+        let active_stick = PadState { rx: 15_000, ..Default::default() };
+        assert_eq!(pick_active_pad(&[idle, active_btn]), Some(active_btn));
+        assert_eq!(pick_active_pad(&[idle, active_stick]), Some(active_stick));
+        assert_eq!(pick_active_pad(&[idle, idle]), Some(idle));
+        assert!(!pad_has_input(PadState { lx: 10_000, ..Default::default() }));
+        assert!(pad_has_input(PadState { lx: 10_001, ..Default::default() }));
     }
 }

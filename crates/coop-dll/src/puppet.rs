@@ -150,6 +150,8 @@ pub struct Puppet {
     peers: PeerSet,
     /// The peer ids last logged (a line when the set changes).
     peers_logged: Vec<PeerId>,
+    /// Player-to-player ground item drop & pickup manager (itemdrop.rs).
+    itemdrop: crate::itemdrop::ItemDrop,
 }
 
 /// After our own Warp call the old world is torn down during the fade-out,
@@ -186,6 +188,7 @@ impl Puppet {
         // Native session (nsession.rs): every patch out before the world goes (no-op when off).
         crate::nsession::on_world_reset(why);
         crate::restsync::on_world_reset();
+        self.itemdrop.on_world_reset();
         self.friend_tags.clear();
         ui::publish_tags(Vec::new());
         self.ghost_died = false;
@@ -227,7 +230,7 @@ impl Puppet {
             in_world_for,
             press,
             mask,
-            excluded: talking || crate::cutscene::active() || ui::panel_visible() || game::load_pending(),
+            excluded: talking || crate::cutscene::active() || ui::panel_visible() || crate::itemdrop::panel_visible() || crate::inputblock::blocked() || game::load_pending(),
         });
         let state = || {
             format!(
@@ -260,6 +263,7 @@ impl Puppet {
                     state()
                 ));
                 crate::statelog::dump(self.probe.current(player).unwrap_or(0));
+                crate::inputblock::force_release();
                 bossrules::alive_stuck_reset("stuck (alive, no input)");
                 if let Some(v) = crate::spectate_cam::clear_stray_free_cam() {
                     log::line(&format!("stuck: the free-cam switch GameRend+0xE0 was {v} (not ours): written 0"));
@@ -313,8 +317,9 @@ impl Puppet {
             }
             _ => Role::Solo,
         };
-        // The latch. The game is only asked while a stamp is fresh or the panel is up.
-        if enabled {
+        // The latch only runs when the in-game CooP Settings menu is enabled (`ingame_menu`).
+        let track_list = enabled;
+        if track_list {
             let age = crate::quitblock::system_list_age_ms();
             if self.menu_open || age.is_some_and(|a| a < menu::STAMP_FRESH_MS) {
                 let input = menu::LatchIn {
@@ -526,9 +531,11 @@ impl Puppet {
             self.boss.on_loading();
             self.cutscene.on_loading();
             self.stuck.on_loading();
+            self.itemdrop.on_loading();
             crate::talklock::on_loading();
             self.scaling.reset();
             // Own world (ownworld.rs): an armed restore is written during this loading screen.
+            crate::ui::set_hud_visible(false);
             crate::ownworld::on_loading();
             return;
         };
@@ -540,6 +547,7 @@ impl Puppet {
             self.boss.on_loading();
             self.cutscene.on_loading();
             self.stuck.on_loading();
+            self.itemdrop.on_loading();
             crate::talklock::on_loading();
             self.scaling.reset();
         }
@@ -553,6 +561,12 @@ impl Puppet {
         }
         let hands_off = self.warp_pending.is_some();
         let here = game::current_block();
+        crate::ui::set_hud_visible(crate::ui::should_show_world_hud(
+            true,
+            hands_off,
+            game::menu_mask(),
+            crate::cutscene::active(),
+        ));
         // The friend's native remote (validated in native.rs `tick` last
         // frame; loads forget it before this point).
         let native_friend = self.native.net_remote();
@@ -696,6 +710,7 @@ impl Puppet {
                     enemies: &self.enemies,
                     player,
                     in_world_for: in_world_since.elapsed(),
+                    down_slots: crate::world::down_slots(),
                 });
                 // Auditor: what one player got and another did not (§32, per peer: PLAN-MULTIPLAYER
                 // §5.19); observes only.
@@ -785,6 +800,16 @@ impl Puppet {
             self.friend_tags.clear();
             self.party.clear();
             self.party_last_hp.clear();
+        }
+        if let Some(Some(n)) = self.net.as_mut()
+            && (n.connected() || n.is_hosting_open())
+        {
+            if !hands_off {
+                crash::breadcrumb("itemdrop");
+                self.itemdrop.tick(n, &self.peers, player, here, in_world_since.elapsed(), self.menu_open);
+            }
+        } else {
+            self.itemdrop.on_disconnected();
         }
         ui::publish_tags(self.friend_tags.clone());
         if hands_off {
@@ -1459,9 +1484,11 @@ fn death_sync(
             if all_dead(&dead) {
                 // No boss record from anybody may come back after a wipe (live 2026-10-24: the
                 // friend's old Genichiro record was restored 2 s after "no restore").
-                crate::persist::note_wipe_loaded("death_sync");
+                crate::persist::note_wipe_loaded("death_sync", peers);
+                n.send_event(crate::world::EV_WIPE, 0, 0);
+                let respawned = crate::world::respawn_all_wipe("death_sync");
                 log::line(&format!(
-                    "death: {} died (wipe): no restore, fresh world for everyone",
+                    "death: {} died (wipe): no restore, fresh world for everyone (respawned={respawned})",
                     if dead.len() > 1 { "every player" } else { "both" }
                 ));
             } else {
@@ -1486,7 +1513,7 @@ fn death_sync(
                 ));
                 continue;
             }
-            if crate::persist::wipe_recent(crate::persist::WIPE_STALE) {
+            if crate::persist::wipe_active() {
                 log::line(&format!(
                     "death: peer {}'s list of {} dead enemies ignored: wipe recent (stale before the wipe)",
                     from.slot(),

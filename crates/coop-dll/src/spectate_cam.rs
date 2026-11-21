@@ -599,6 +599,7 @@ pub struct SpectateCam {
     /// Game camera angles of the previous frame (source A).
     last_a: Option<(f32, f32)>,
     a_moved: bool,
+    a_last_moved_at: Option<Instant>,
     a_off_logged: bool,
     /// Source A was frozen: the stick is used (this engage).
     auto_b: bool,
@@ -706,6 +707,7 @@ impl SpectateCam {
         self.engaged_at = Some(now);
         self.last_a = None;
         self.a_moved = false;
+        self.a_last_moved_at = None;
         self.a_off_logged = false;
         self.auto_b = false;
         self.flick.reset();
@@ -818,6 +820,7 @@ impl SpectateCam {
         let mut turn = (0.0f32, 0.0f32); // (yaw of the view, orbit pitch)
         let mut cycle: Option<i8> = None;
         let mut a_turn = 0.0f32;
+        let mut a_moved_now = false;
         if mode == 1 {
             match chrcam_fwd().and_then(input::fwd_angles) {
                 Some(cur) => {
@@ -825,6 +828,8 @@ impl SpectateCam {
                         && let Some((dy, dp)) = input::angle_delta(last, cur)
                         && input::is_motion(dy, dp)
                     {
+                        a_moved_now = true;
+                        self.a_last_moved_at = Some(now);
                         if !self.a_moved {
                             self.a_moved = true;
                             log::line("spectate: orbit input from the game camera");
@@ -842,12 +847,17 @@ impl SpectateCam {
                     }
                 }
             }
-            if !self.auto_b && input::frozen_after(engaged_for, self.a_moved) {
+            if !self.auto_b
+                && input::source_a_stalled(
+                    engaged_for,
+                    self.a_last_moved_at.map(|t| now.saturating_duration_since(t)),
+                )
+            {
                 self.auto_b = true;
                 log::line("spectate: game camera frozen while dead, using XInput / mouse / arrows");
             }
         }
-        if mode == 2 || self.auto_b {
+        if mode == 2 || (self.auto_b && !a_moved_now) {
             // Orbit axes: the pad stick, else mouse look / arrow keys (sample.look).
             let (sx, sy) = sample.look;
             let (dy, dp) = input::stick_orbit(sx, sy, dt, tuning::spectate_orbit_speed(), hand);

@@ -25,13 +25,16 @@
 //! `max_players` with Reject(Full). A joiner that finds the lobby full says so (`take_full`).
 //! SteamIDs are shortened in the log.
 
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::collections::hash_map::RandomState;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{self, Relaxed}};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use coop_net::protocol::VERSION;
 use coop_net::{Datagram, steam_addr, steam_id_of};
@@ -70,12 +73,15 @@ const MM_GET_LOBBY_OWNER: usize = 35;
 const MSG_SEND: usize = 0;
 const MSG_RECEIVE: usize = 1;
 const MSG_ACCEPT: usize = 2;
+const MSG_CLOSE: usize = 3;
 
 // Enums and callback ids.
+const LOBBY_TYPE_PRIVATE: i32 = 0;
 const LOBBY_TYPE_PUBLIC: i32 = 2;
 const LOBBY_TYPE_INVISIBLE: i32 = 3;
 const COMPARISON_EQUAL: i32 = 0;
 const DISTANCE_WORLDWIDE: i32 = 3;
+const CB_GAME_LOBBY_JOIN_REQUESTED: i32 = 333;
 const CB_LOBBY_ENTER: i32 = 504;
 const CB_LOBBY_MATCH_LIST: i32 = 510;
 const CB_LOBBY_CREATED: i32 = 513;
@@ -92,6 +98,8 @@ const SEND_UNRELIABLE_NO_NAGLE: i32 = 1;
 
 const LOBBY_KEY: &str = "sekiro_coop";
 const LOBBY_PROTO: &str = "proto";
+const LOBBY_TOKEN_KEY: &str = "coop_token";
+const INVITE_ONLY_MARKER: &str = "invite_only";
 
 fn short(id: u64) -> String {
     format!("..{:04}", id % 10000)
@@ -152,12 +160,161 @@ macro_rules! vcall_id {
 /// ISteamUtils slots of the two layouts: (IsAPICallCompleted, GetAPICallFailureReason, GetAPICallResult).
 const UTILS_LAYOUTS: [(&str, [usize; 3]); 2] = [("SteamUtils010", [11, 12, 13]), ("SteamUtils011", [10, 11, 12])];
 
+/// ISteamFriends `ActivateGameOverlayInviteDialog(CSteamID)` slot, verified in steamclient64.dll.
+const FRIENDS_LAYOUTS: [(&str, usize); 2] = [("SteamFriends018", 32), ("SteamFriends017", 33)];
+
+/// `GameLobbyJoinRequested_t` (k_iCallback = 333): fired by Steam when the player accepts an
+/// overlay invite or clicks "Join Game" while Sekiro is already running.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GameLobbyJoinRequested {
+    lobby_id: u64,
+    friend_id: u64,
+}
+
+#[repr(C)]
+struct CCallbackVtable {
+    run_call_result: unsafe extern "system" fn(*mut CCallbackBase, *const GameLobbyJoinRequested, u8, u64),
+    run: unsafe extern "system" fn(*mut CCallbackBase, *const GameLobbyJoinRequested),
+    get_size: unsafe extern "system" fn(*mut CCallbackBase) -> i32,
+}
+
+#[repr(C)]
+struct CCallbackBase {
+    vtable: *const CCallbackVtable,
+    flags: u8,
+    callback_id: i32,
+}
+
+struct CallbackSlot(UnsafeCell<CCallbackBase>);
+unsafe impl Sync for CallbackSlot {}
+
+static PENDING_INVITE_LOBBY: AtomicU64 = AtomicU64::new(0);
+static CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+unsafe fn handle_join_request(param: *const GameLobbyJoinRequested) {
+    if param.is_null() {
+        return;
+    }
+    let req = unsafe { param.read_unaligned() };
+    if req.lobby_id != 0 {
+        log::line(&format!(
+            "steam: overlay invite accepted (lobby {}, friend {})",
+            short(req.lobby_id),
+            short(req.friend_id)
+        ));
+        PENDING_INVITE_LOBBY.store(req.lobby_id, Ordering::Release);
+    }
+}
+
+unsafe extern "system" fn on_join_req_call_result(
+    _this: *mut CCallbackBase,
+    param: *const GameLobbyJoinRequested,
+    _io_fail: u8,
+    _api_call: u64,
+) {
+    unsafe { handle_join_request(param) };
+}
+
+unsafe extern "system" fn on_join_req_run(_this: *mut CCallbackBase, param: *const GameLobbyJoinRequested) {
+    unsafe { handle_join_request(param) };
+}
+
+unsafe extern "system" fn get_join_req_size(_this: *mut CCallbackBase) -> i32 {
+    std::mem::size_of::<GameLobbyJoinRequested>() as i32
+}
+
+static JOIN_REQ_VTABLE: CCallbackVtable = CCallbackVtable {
+    run_call_result: on_join_req_call_result,
+    run: on_join_req_run,
+    get_size: get_join_req_size,
+};
+
+static JOIN_REQ_CALLBACK: CallbackSlot = CallbackSlot(UnsafeCell::new(CCallbackBase {
+    vtable: &JOIN_REQ_VTABLE,
+    flags: 0,
+    callback_id: CB_GAME_LOBBY_JOIN_REQUESTED,
+}));
+
+/// Checks `+connect_lobby <id>` once at start-up, ensures `GameLobbyJoinRequested_t` (333) is
+/// registered once Steam API handles are ready, and pops any newly accepted Steam lobby ID.
+pub fn poll_invite() -> Option<u64> {
+    static ARGS_CHECKED: OnceLock<()> = OnceLock::new();
+    ARGS_CHECKED.get_or_init(|| {
+        let mut args = std::env::args();
+        while let Some(arg) = args.next() {
+            if arg == "+connect_lobby"
+                && let Some(val) = args.next()
+                && let Ok(id) = val.trim().parse::<u64>()
+                && id != 0
+            {
+                log::line(&format!("steam: launch argument +connect_lobby {}", short(id)));
+                PENDING_INVITE_LOBBY.store(id, Ordering::Release);
+            }
+        }
+    });
+
+    if !CALLBACK_REGISTERED.load(Ordering::Acquire) {
+        static NEXT_CB_CHECK: AtomicU32 = AtomicU32::new(0);
+        if NEXT_CB_CHECK.fetch_add(1, Relaxed) % 60 == 0 {
+            let api_dll = module("steam_api64.dll");
+            if !api_dll.is_null() {
+                let get_user = export(api_dll, "SteamAPI_GetHSteamUser");
+                let get_pipe = export(api_dll, "SteamAPI_GetHSteamPipe");
+                let register_cb = export(api_dll, "SteamAPI_RegisterCallback");
+                if get_user != 0 && get_pipe != 0 && register_cb != 0 {
+                    let user: i32 = unsafe { std::mem::transmute::<usize, extern "C" fn() -> i32>(get_user)() };
+                    let pipe: i32 = unsafe { std::mem::transmute::<usize, extern "C" fn() -> i32>(get_pipe)() };
+                    if user != 0 && pipe != 0 {
+                        let register: unsafe extern "C" fn(*mut CCallbackBase, i32) =
+                            unsafe { std::mem::transmute(register_cb) };
+                        unsafe { register(JOIN_REQ_CALLBACK.0.get(), CB_GAME_LOBBY_JOIN_REQUESTED) };
+                        CALLBACK_REGISTERED.store(true, Ordering::Release);
+                        log::line("steam: registered GameLobbyJoinRequested_t callback (333)");
+                    }
+                }
+            }
+        }
+    }
+
+    if PENDING_INVITE_LOBBY.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let id = PENDING_INVITE_LOBBY.swap(0, Ordering::AcqRel);
+    (id != 0).then_some(id)
+}
+
+/// Generates a per-lobby 128-bit ephemeral invite token for coop-net handshake auth.
+pub fn generate_invite_token() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mix = |salt: u64| -> u64 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.write_u32(std::process::id());
+        h.write_u64(SEQ.fetch_add(1, Relaxed).wrapping_add(salt));
+        h.finish()
+    };
+    format!("inv:{:016x}{:016x}", mix(0x9e37_79b9_7f4a_7c15), mix(0xbf58_476d_1ce4_e5b9))
+}
+
+/// Combines an ephemeral lobby token and optional user password into the session secret.
+pub fn session_secret(token: &str, password: &str) -> String {
+    if token.is_empty() {
+        password.to_owned()
+    } else if password.is_empty() {
+        token.to_owned()
+    } else {
+        format!("{token}:{password}")
+    }
+}
+
 /// The Steam interfaces we use. Calls happen on the game thread only.
 pub struct Api {
     mm: *mut c_void,
     utils: *mut c_void,
     msgs: *mut c_void,
     friends: *mut c_void,
+    friends_invite_slot: usize,
     utils_slots: [usize; 3],
     /// Our own SteamID64.
     pub me: u64,
@@ -247,7 +404,14 @@ impl Api {
         let (mm, _) = generic(&["SteamMatchMaking009"]).ok_or("no ISteamMatchmaking (SteamMatchMaking009)")?;
         let (msgs, _) = generic(&["SteamNetworkingMessages002"]).ok_or("no ISteamNetworkingMessages (SteamNetworkingMessages002)")?;
         let (user_if, _) = generic(&["SteamUser023", "SteamUser022", "SteamUser021", "SteamUser020"]).ok_or("no ISteamUser (SteamUser020-023)")?;
-        let (friends, _) = generic(&["SteamFriends018", "SteamFriends017"]).unwrap_or((std::ptr::null_mut(), String::new()));
+        let mut friends = None;
+        for (v, invite_slot) in FRIENDS_LAYOUTS {
+            if let Some((p, _)) = generic(&[v]) {
+                friends = Some((p, invite_slot));
+                break;
+            }
+        }
+        let (friends, friends_invite_slot) = friends.unwrap_or((std::ptr::null_mut(), 32));
         let mut utils = None;
         for (v, slots) in UTILS_LAYOUTS {
             if let Some((p, _)) = generic(&[v]) {
@@ -260,9 +424,18 @@ impl Api {
         if me == 0 {
             return Err("ISteamUser::GetSteamID returned 0".into());
         }
-        let api = Api { mm, utils, msgs, friends, utils_slots, me };
+        let api = Api { mm, utils, msgs, friends, friends_invite_slot, utils_slots, me };
         trace.push(format!("steam: interfaces ready, own SteamID {}, persona name {:?}", short(me), api.persona_name()));
         Ok(Arc::new(api))
+    }
+
+    /// Opens Steam's overlay "Invite to Game" dialog for `lobby`.
+    pub fn open_invite_dialog(&self, lobby: u64) -> bool {
+        if self.friends.is_null() || lobby == 0 {
+            return false;
+        }
+        vcall!(self.friends, self.friends_invite_slot, (u64) -> (), lobby);
+        true
     }
 
     /// The Steam display name, if ISteamFriends was found.
@@ -376,6 +549,11 @@ impl Api {
         vcall!(self.msgs, MSG_ACCEPT, (*const c_void) -> u8, ident.as_ptr() as *const c_void) != 0
     }
 
+    fn close_session(&self, id: u64) -> bool {
+        let ident = Self::identity(id);
+        vcall!(self.msgs, MSG_CLOSE, (*const c_void) -> u8, ident.as_ptr() as *const c_void) != 0
+    }
+
     /// Takes the messages waiting on channel 0 (data and sender), releasing each.
     fn receive(&self, out: &mut VecDeque<(Vec<u8>, u64)>) {
         let mut ptrs = [std::ptr::null_mut::<u8>(); 16];
@@ -407,13 +585,53 @@ impl Api {
 pub struct SteamTransport {
     api: Arc<Api>,
     inbox: Mutex<VecDeque<(Vec<u8>, u64)>>,
+    lobby: AtomicU64,
+    allowed: Mutex<Vec<u64>>,
     send_failures: AtomicU32,
+    drop_notices: AtomicU32,
     received: AtomicU32,
 }
 
 impl SteamTransport {
     pub fn new(api: Arc<Api>) -> Self {
-        Self { api, inbox: Mutex::new(VecDeque::new()), send_failures: AtomicU32::new(0), received: AtomicU32::new(0) }
+        Self {
+            api,
+            inbox: Mutex::new(VecDeque::new()),
+            lobby: AtomicU64::new(0),
+            allowed: Mutex::new(Vec::new()),
+            send_failures: AtomicU32::new(0),
+            drop_notices: AtomicU32::new(0),
+            received: AtomicU32::new(0),
+        }
+    }
+
+    pub fn set_lobby(&self, lobby: u64) {
+        self.lobby.store(lobby, Relaxed);
+    }
+
+    pub fn set_allowed(&self, peers: &[u64]) {
+        if let Ok(mut guard) = self.allowed.lock() {
+            guard.clear();
+            guard.extend_from_slice(peers);
+        }
+    }
+
+    fn is_peer_allowed(&self, from: u64) -> bool {
+        if let Ok(guard) = self.allowed.lock()
+            && guard.contains(&from)
+        {
+            return true;
+        }
+        let lid = self.lobby.load(Relaxed);
+        if lid != 0 && (self.api.lobby_owner(lid) == from || self.api.members(lid).contains(&from)) {
+            if let Ok(mut guard) = self.allowed.lock()
+                && !guard.contains(&from)
+            {
+                guard.push(from);
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -438,6 +656,17 @@ impl Datagram for SteamTransport {
             self.api.receive(&mut inbox);
         }
         while let Some((data, from)) = inbox.pop_front() {
+            if !self.is_peer_allowed(from) {
+                self.api.close_session(from);
+                let n = self.drop_notices.fetch_add(1, Relaxed) + 1;
+                if n <= 5 || n % 200 == 0 {
+                    log::line(&format!(
+                        "steam: dropped message from unauthorized user {} (not in current lobby, #{n})",
+                        short(from)
+                    ));
+                }
+                continue;
+            }
             if data.len() > buf.len() {
                 continue;
             }
@@ -453,6 +682,32 @@ impl Datagram for SteamTransport {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(steam_addr(self.api.me))
     }
+}
+
+/// Wrapper so `Arc<SteamTransport>` implements `coop_net::Datagram` (orphan rule).
+pub struct SharedSteamTransport(pub Arc<SteamTransport>);
+
+impl Datagram for SharedSteamTransport {
+    fn send_to(&self, buf: &[u8], to: SocketAddr) -> io::Result<usize> {
+        self.0.send_to(buf, to)
+    }
+
+    fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+}
+
+/// How the lobby finds and restricts peers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LobbyMode {
+    /// Private invite-only lobby (`k_ELobbyTypePrivate`): never searchable, only invited players can join.
+    InviteOnly { target: Option<u64> },
+    /// Legacy password-hashed searchable lobby (`k_ELobbyTypeInvisible`).
+    Password,
 }
 
 /// What the player's `role` setting asks of the lobby.
@@ -477,12 +732,14 @@ enum Phase {
 
 /// A change the session must follow.
 pub enum Out {
-    /// We own a lobby and wait for the friend.
-    Hosting,
-    /// We joined a lobby; the friend (its owner) is this SteamID64.
-    JoinedHost(u64),
+    /// We own a lobby and wait for friends (carrying the active coop-net secret).
+    Hosting { secret: String },
+    /// We joined a lobby; `host` is the owner's SteamID64 and `secret` authenticates Hello.
+    JoinedHost { host: u64, secret: String },
     /// The lobby we were in is gone: back to waiting.
     HostLeft,
+    /// Joining an invited lobby failed (full, version mismatch, expired invite, etc.).
+    InviteFailed(String),
 }
 
 const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(1);
@@ -493,16 +750,22 @@ const NUDGE: &[u8] = b"SKCO";
 const PROBE_EVERY: Duration = Duration::from_secs(8);
 const HOST_GONE_AFTER: Duration = Duration::from_secs(6);
 const HOST_SILENT_AFTER: Duration = Duration::from_secs(30);
+const INVITE_TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Steam lobby state machine, driven by `tick` once per frame.
 pub struct Lobby {
     api: Arc<Api>,
+    transport: Arc<SteamTransport>,
+    password: String,
     key: String,
+    token: String,
+    mode: LobbyMode,
     want: Want,
     /// Lobby size when we create one (`max_players`, the host included).
     max_members: i32,
     phase: Phase,
     lobby: u64,
+    joined_at: Option<Instant>,
     /// Joined: the lobby's host.
     host: Option<u64>,
     /// Hosting: the other lobby members whose message sessions we accepted (all of them, in
@@ -521,19 +784,33 @@ pub struct Lobby {
     full: bool,
     /// Joiner: `full` became true and nobody was told yet (`take_full`).
     full_news: bool,
+    /// Steam rejected lobby creation (e.g. `EResultAccessDenied`); allows immediate UDP fallback in Auto mode.
+    hard_failed: bool,
 }
 
 impl Lobby {
     /// `max_members`: lobby size for a lobby we create (`tuning::max_players()`).
-    pub fn new(api: Arc<Api>, password: &str, want: Want, max_members: i32) -> Self {
+    pub fn new(
+        api: Arc<Api>,
+        transport: Arc<SteamTransport>,
+        password: &str,
+        want: Want,
+        mode: LobbyMode,
+        max_members: i32,
+    ) -> Self {
         let now = Instant::now();
         Self {
             api,
+            transport,
+            password: password.to_owned(),
             key: lobby_key(password),
+            token: generate_invite_token(),
+            mode,
             want,
             max_members: max_members.clamp(2, crate::peers::MAX_PLAYERS as i32),
             phase: Phase::Idle { at: now },
             lobby: 0,
+            joined_at: None,
             host: None,
             members: Vec::new(),
             probe: None,
@@ -545,7 +822,21 @@ impl Lobby {
             last_error: None,
             full: false,
             full_news: false,
+            hard_failed: false,
         }
+    }
+
+    pub fn hard_failed(&self) -> bool {
+        self.hard_failed
+    }
+
+    pub fn open_invite_overlay(&self) -> bool {
+        if matches!(self.phase, Phase::Hosting) && self.lobby != 0 {
+            let ok = self.api.open_invite_dialog(self.lobby);
+            log::line(&format!("steam: open invite dialog for lobby {} -> {ok}", short(self.lobby)));
+            return ok;
+        }
+        false
     }
 
     /// `max_players` changed in the settings: the lobby we host follows (it was created with
@@ -587,6 +878,8 @@ impl Lobby {
                     "the host's world is full (Steam), trying again".into()
                 } else if let Some(e) = &self.last_error {
                     format!("Steam lobby problem: {e}")
+                } else if matches!(self.mode, LobbyMode::InviteOnly { target: None }) {
+                    "waiting for a Steam invite".into()
                 } else if self.want == Want::Join {
                     "searching for the friend's lobby (Steam)".into()
                 } else {
@@ -595,6 +888,9 @@ impl Lobby {
             }
             Phase::Creating { .. } => "opening a lobby (Steam)".into(),
             Phase::Joining { .. } => "joining the friend's lobby (Steam)".into(),
+            Phase::Hosting if matches!(self.mode, LobbyMode::InviteOnly { .. }) => {
+                "hosting (Steam) - use Kindred Bell again to invite friends".into()
+            }
             Phase::Hosting => "hosting (Steam) - waiting for friend".into(),
             Phase::Joined => "joined the lobby (Steam), connecting to host".into(),
         }
@@ -617,15 +913,26 @@ impl Lobby {
         self.phase = Phase::Idle { at: Instant::now() + Duration::from_secs(secs) };
     }
 
-    /// Leaves the current lobby, if any.
-    fn leave(&mut self) {
+    /// Leaves the current lobby, if any, and closes all active transport allowlists.
+    pub fn leave(&mut self) {
+        for m in self.members.drain(..) {
+            self.api.close_session(m);
+        }
+        if let Some(h) = self.host.take() {
+            self.api.close_session(h);
+        }
+        self.transport.set_lobby(0);
+        self.transport.set_allowed(&[]);
         if self.lobby != 0 {
+            if matches!(self.phase, Phase::Hosting) {
+                self.api.set_joinable(self.lobby, false);
+                let _ = self.api.set_lobby_data(self.lobby, LOBBY_TOKEN_KEY, "");
+            }
             self.api.leave_lobby(self.lobby);
             log::line(&format!("steam: left lobby {}", short(self.lobby)));
         }
         self.lobby = 0;
-        self.host = None;
-        self.members.clear();
+        self.joined_at = None;
         self.host_missing_since = None;
         self.probe = None;
     }
@@ -660,7 +967,23 @@ impl Lobby {
         match self.phase {
             Phase::Idle { at } => {
                 if now >= at {
-                    if self.want == Want::Host { self.create(LOBBY_TYPE_INVISIBLE) } else { self.search(true) }
+                    if self.want == Want::Host {
+                        let ty = if matches!(self.mode, LobbyMode::InviteOnly { .. }) {
+                            LOBBY_TYPE_PRIVATE
+                        } else {
+                            LOBBY_TYPE_INVISIBLE
+                        };
+                        self.create(ty);
+                    } else if let LobbyMode::InviteOnly { target } = self.mode {
+                        if let Some(id) = target {
+                            let call = self.api.join_lobby(id);
+                            log::line(&format!("steam: joining invited lobby {} (call {call})", short(id)));
+                            self.lobby = id;
+                            self.phase = Phase::Joining { call };
+                        }
+                    } else {
+                        self.search(true);
+                    }
                 }
                 None
             }
@@ -707,8 +1030,14 @@ impl Lobby {
                     CallState::Pending => None,
                     CallState::Failed(e) => {
                         log::line(&format!("steam: join failed: {e}"));
-                        self.last_error = Some(e);
+                        self.last_error = Some(e.clone());
                         self.lobby = 0;
+                        if let LobbyMode::InviteOnly { target } = &mut self.mode
+                            && target.take().is_some()
+                        {
+                            self.idle(5);
+                            return Some(Out::InviteFailed(format!("Could not join the invited Steam lobby ({e}).")));
+                        }
                         self.idle(3);
                         None
                     }
@@ -718,23 +1047,41 @@ impl Lobby {
                         if response == ENTER_SUCCESS {
                             log::line(&format!("steam: entered lobby {}", short(entered)));
                             self.lobby = entered;
+                            self.joined_at = Some(now);
+                            self.transport.set_lobby(entered);
                             self.last_error = None;
                             self.full = false;
+                            self.hard_failed = false;
                             self.last_connected = now;
                             self.phase = Phase::Joined;
-                        } else if response == ENTER_FULL {
-                            log::line("steam: the lobby is full (EChatRoomEnterResponse 4), trying again in 5 s");
-                            self.full_news |= !self.full;
-                            self.full = true;
-                            self.lobby = 0;
-                            self.idle(5);
+                            None
                         } else {
-                            log::line(&format!("steam: could not enter the lobby, EChatRoomEnterResponse {response}"));
-                            self.last_error = Some(format!("lobby refused us (response {response})"));
-                            self.lobby = 0;
-                            self.idle(3);
+                            let is_invite = matches!(self.mode, LobbyMode::InviteOnly { target: Some(_) });
+                            if let LobbyMode::InviteOnly { target } = &mut self.mode {
+                                *target = None;
+                            }
+                            if response == ENTER_FULL {
+                                log::line("steam: the lobby is full (EChatRoomEnterResponse 4), trying again in 5 s");
+                                self.full_news |= !self.full;
+                                self.full = true;
+                                self.lobby = 0;
+                                self.idle(5);
+                                if is_invite {
+                                    return Some(Out::InviteFailed("The host's Steam lobby is full.".into()));
+                                }
+                            } else {
+                                log::line(&format!("steam: could not enter the lobby, EChatRoomEnterResponse {response}"));
+                                self.last_error = Some(format!("lobby refused us (response {response})"));
+                                self.lobby = 0;
+                                self.idle(3);
+                                if is_invite {
+                                    return Some(Out::InviteFailed(format!(
+                                        "Could not join the invited Steam lobby (response {response})."
+                                    )));
+                                }
+                            }
+                            None
                         }
-                        None
                     }
                 }
             }
@@ -751,26 +1098,44 @@ impl Lobby {
                         let at4 = u64::from_le_bytes(buf[4..12].try_into().unwrap());
                         let lobby = if valid(at8) { at8 } else if valid(at4) { at4 } else { at8 };
                         if result == RESULT_ACCESS_DENIED {
+                            self.hard_failed = true;
                             return self.create_failed(
                                 lobby_type,
-                                format!("LobbyCreated EResult {result} (access denied: needs Sekiro owned on this Steam account and Steam online; use transport = udp)"),
+                                format!("LobbyCreated EResult {result} (Steam lobby unavailable; switch Connection mode to Direct UDP or set transport = udp)"),
                             );
                         }
                         if result != RESULT_OK || lobby == 0 {
                             return self.create_failed(lobby_type, format!("LobbyCreated EResult {result}"));
                         }
+                        self.hard_failed = false;
                         self.lobby = lobby;
-                        let ok_key = self.api.set_lobby_data(lobby, LOBBY_KEY, &self.key);
-                        let ok_proto = self.api.set_lobby_data(lobby, LOBBY_PROTO, &VERSION.to_string());
-                        self.api.set_joinable(lobby, true);
-                        log::line(&format!(
-                            "steam: lobby {} created (type {lobby_type}, data set: key {ok_key}, proto {ok_proto}, protocol {VERSION})",
-                            short(lobby)
-                        ));
+                        self.transport.set_lobby(lobby);
+                        self.transport.set_allowed(&[]);
+                        let invite_only = matches!(self.mode, LobbyMode::InviteOnly { .. });
+                        let secret = if invite_only {
+                            let ok_key = self.api.set_lobby_data(lobby, LOBBY_KEY, INVITE_ONLY_MARKER);
+                            let ok_tok = self.api.set_lobby_data(lobby, LOBBY_TOKEN_KEY, &self.token);
+                            let ok_proto = self.api.set_lobby_data(lobby, LOBBY_PROTO, &VERSION.to_string());
+                            self.api.set_joinable(lobby, true);
+                            log::line(&format!(
+                                "steam: private invite lobby {} created (type {lobby_type}, data set: key {ok_key}, token {ok_tok}, proto {ok_proto}, protocol {VERSION})",
+                                short(lobby)
+                            ));
+                            session_secret(&self.token, &self.password)
+                        } else {
+                            let ok_key = self.api.set_lobby_data(lobby, LOBBY_KEY, &self.key);
+                            let ok_proto = self.api.set_lobby_data(lobby, LOBBY_PROTO, &VERSION.to_string());
+                            self.api.set_joinable(lobby, true);
+                            log::line(&format!(
+                                "steam: lobby {} created (type {lobby_type}, data set: key {ok_key}, proto {ok_proto}, protocol {VERSION})",
+                                short(lobby)
+                            ));
+                            self.password.clone()
+                        };
                         self.last_error = None;
                         self.phase = Phase::Hosting;
                         self.probe_at = now + PROBE_EVERY;
-                        Some(Out::Hosting)
+                        Some(Out::Hosting { secret })
                     }
                 }
             }
@@ -786,6 +1151,7 @@ impl Lobby {
             // is the same for the search, so try that before giving up.
             self.create(LOBBY_TYPE_PUBLIC);
         } else {
+            // Never fall back from LOBBY_TYPE_PRIVATE to a public/searchable lobby.
             self.last_error = Some(why);
             self.idle(5);
         }
@@ -802,6 +1168,13 @@ impl Lobby {
             self.housekeeping_at = now;
             let me = self.api.me;
             let members: Vec<u64> = self.api.members(self.lobby).into_iter().filter(|&m| m != me).collect();
+            for &old in &self.members {
+                if !members.contains(&old) {
+                    self.api.close_session(old);
+                    log::line(&format!("steam: lobby member {} left, closed its message session", short(old)));
+                }
+            }
+            self.transport.set_allowed(&members);
             for &m in &members {
                 let ok = self.api.accept(m);
                 if !linked.contains(&m) {
@@ -814,8 +1187,8 @@ impl Lobby {
             self.members = members;
         }
         // Auto role, still alone: a friend who opened a lobby at the same moment is a second
-        // lobby. The lowest id wins; the other side switches.
-        if self.want == Want::Auto && !connected {
+        // lobby. The lowest id wins; the other side switches (password mode only).
+        if matches!(self.mode, LobbyMode::Password) && self.want == Want::Auto && !connected {
             if let Some(call) = self.probe {
                 let mut buf = [0u8; 8];
                 match self.api.poll_call(call, CB_LOBBY_MATCH_LIST, &mut buf[..4]) {
@@ -848,20 +1221,59 @@ impl Lobby {
     }
 
     fn tick_joined(&mut self, now: Instant) -> Option<Out> {
-        if now.duration_since(self.housekeeping_at) < HOUSEKEEPING_EVERY {
+        let every = if self.host.is_none() { WAITING_MEMBER_EVERY } else { HOUSEKEEPING_EVERY };
+        if now.duration_since(self.housekeeping_at) < every {
             return None;
         }
         self.housekeeping_at = now;
         let members = self.api.members(self.lobby);
         let Some(host) = self.host else {
+            let invite_only = matches!(self.mode, LobbyMode::InviteOnly { .. });
+            let proto = self.api.lobby_data(self.lobby, LOBBY_PROTO);
+            if !proto.is_empty() && proto != VERSION.to_string() {
+                self.other_version = true;
+                if invite_only {
+                    self.leave();
+                    if let LobbyMode::InviteOnly { target } = &mut self.mode {
+                        *target = None;
+                    }
+                    self.idle(5);
+                    return Some(Out::InviteFailed(format!(
+                        "The host runs another CooP Sekiro version (protocol {proto}, yours is {VERSION})."
+                    )));
+                }
+            }
             // The lobby owner is the host; owner data of a lobby we just entered can lag a moment.
             let owner = self.api.lobby_owner(self.lobby);
-            let host = Some(owner).filter(|&o| o != 0 && o != self.api.me).or_else(|| members.iter().copied().find(|&m| m != self.api.me));
+            let host = Some(owner)
+                .filter(|&o| o != 0 && o != self.api.me)
+                .or_else(|| members.iter().copied().find(|&m| m != self.api.me));
+            let token = if invite_only { self.api.lobby_data(self.lobby, LOBBY_TOKEN_KEY) } else { String::new() };
+            if invite_only && token.is_empty() {
+                if self.joined_at.is_some_and(|t| now.duration_since(t) >= INVITE_TOKEN_TIMEOUT) {
+                    self.leave();
+                    if let LobbyMode::InviteOnly { target } = &mut self.mode {
+                        *target = None;
+                    }
+                    self.idle(5);
+                    return Some(Out::InviteFailed(
+                        "The host's lobby did not provide an invite token (check mod versions).".into(),
+                    ));
+                }
+                return None;
+            }
             if let Some(h) = host {
+                self.transport.set_lobby(self.lobby);
+                self.transport.set_allowed(&[h]);
                 let ok = self.api.accept(h);
                 log::line(&format!("steam: host is {} (accepted its message session: {ok})", short(h)));
                 self.host = Some(h);
-                return Some(Out::JoinedHost(h));
+                let secret = if invite_only {
+                    session_secret(&token, &self.password)
+                } else {
+                    self.password.clone()
+                };
+                return Some(Out::JoinedHost { host: h, secret });
             }
             return None;
         };
@@ -872,11 +1284,14 @@ impl Lobby {
         let host_silent = now.duration_since(self.last_connected) >= HOST_SILENT_AFTER;
         if host_gone || host_silent {
             log::line(&format!(
-                "steam: host {} {}, leaving the lobby and searching again",
+                "steam: host {} {}, leaving the lobby",
                 short(host),
                 if host_gone { "left the lobby" } else { "does not answer" }
             ));
             self.leave();
+            if let LobbyMode::InviteOnly { target } = &mut self.mode {
+                *target = None;
+            }
             self.idle(0);
             return Some(Out::HostLeft);
         }
@@ -886,10 +1301,7 @@ impl Lobby {
 
 impl Drop for Lobby {
     fn drop(&mut self) {
-        if self.lobby != 0 {
-            self.api.leave_lobby(self.lobby);
-            log::line(&format!("steam: left lobby {}", short(self.lobby)));
-        }
+        self.leave();
     }
 }
 
@@ -906,5 +1318,35 @@ impl Trace {
         } else {
             self.lines.push(line);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_token_has_prefix_length_and_uniqueness() {
+        let a = generate_invite_token();
+        let b = generate_invite_token();
+        assert!(a.starts_with("inv:"));
+        assert_eq!(a.len(), 4 + 32);
+        assert!(a[4..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_secret_combines_token_and_optional_password() {
+        assert_eq!(session_secret("", "wolf"), "wolf");
+        assert_eq!(session_secret("inv:abc", ""), "inv:abc");
+        assert_eq!(session_secret("inv:abc", "wolf"), "inv:abc:wolf");
+    }
+
+    #[test]
+    fn callback_abi_layouts_match_steamworks_windows_x64() {
+        assert_eq!(std::mem::size_of::<GameLobbyJoinRequested>(), 16);
+        assert_eq!(std::mem::size_of::<CCallbackBase>(), 16);
+        assert_eq!(std::mem::offset_of!(CCallbackBase, flags), 8);
+        assert_eq!(std::mem::offset_of!(CCallbackBase, callback_id), 12);
     }
 }

@@ -278,7 +278,7 @@ mod tests {
     use super::*;
 
     fn pad(buttons: u16, rt: u8, rx: i16, ry: i16) -> Option<PadState> {
-        Some(PadState { buttons, lt: 0, rt, rx, ry })
+        Some(PadState { buttons, lt: 0, rt, lx: 0, ly: 0, rx, ry })
     }
 
     #[test]

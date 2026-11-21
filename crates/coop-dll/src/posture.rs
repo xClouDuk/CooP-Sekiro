@@ -52,9 +52,6 @@ use crate::tuning;
 /// window. 0 = v7.6 (always mirror). Default 1.
 pub static REST_GUARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// No host lives onto our copies this long after a death reload of ours (v8.6, persist.rs
-/// `after_death_guard`): covers the other player's later reload in a wipe.
-const DEATH_LIVES_GUARD: std::time::Duration = std::time::Duration::from_secs(45);
 const CHR_MODULES: usize = 0x1FF8;
 const MOD_DATA: usize = 0x18;
 const DATA_HP: usize = 0x130;
@@ -377,11 +374,11 @@ impl Posture {
         let host = self.host_states.get(&id).filter(|(t, _)| now.duration_since(*t) < HOST_FRESH).map(|(_, s)| *s);
         let mut msgs = Vec::new();
         let st = self.client.entry(id).or_default();
-        // v8.15: nothing counts as ours inside the death-reload guard. persist.rs restores the
-        // boss record (lives 2 -> 1) onto the fresh copy there, and that drop was counted as our
-        // own deathblow and sent to the host (live 2026-10-25: 1700201 "friend deathblow lives
-        // 1 -> 0" while the friend stood at the idol 75 m away).
-        let own = if crate::persist::after_death_guard(DEATH_LIVES_GUARD) {
+        // Do not count persisted boss restores, wipe settles, or immediate death reloads as our own hit/deathblow.
+        let own = if crate::persist::wipe_active()
+            || crate::persist::after_death_guard(Duration::from_secs(10))
+            || crate::persist::boss_restored_recently(Duration::from_secs(3))
+        {
             Own::default()
         } else {
             own_change(st.prev, cur, counting)
@@ -432,8 +429,8 @@ impl Posture {
             // old world, persist.rs `after_death_guard`); after a plain death persist's
             // boss restore brings the host's lives instead.
             if !(REST_GUARD.load(std::sync::atomic::Ordering::Relaxed) && crate::restsync::hold_kills())
-                && !crate::persist::after_death_guard(DEATH_LIVES_GUARD)
-                && !crate::persist::wipe_recent(crate::persist::WIPE_STALE)
+                && !crate::persist::wipe_active()
+                && !crate::persist::after_death_guard(Duration::from_secs(15))
                 && mirror_lives(cur.lives, h.lives as i32)
                 && game::write(data + DATA_LIVES, h.lives as i32)
             {

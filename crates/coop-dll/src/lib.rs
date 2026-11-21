@@ -17,6 +17,7 @@ mod anim;
 mod crash;
 mod cutscene;
 mod debuff;
+mod depth;
 mod dialog;
 mod doors;
 mod doctor;
@@ -31,7 +32,9 @@ mod hkbsync;
 mod hook;
 mod icons;
 mod idols;
+mod inputblock;
 mod invguard;
+mod itemdrop;
 mod items;
 mod join;
 mod keyitems;
@@ -239,6 +242,7 @@ fn init(hmodule: usize) {
     } else {
         log::line("ui: overlay NOT installed (overlay_hook = 0): no status line, names or menu this run");
     }
+    let _ = panic::catch_unwind(inputblock::install);
     // Where every stub / fake page went (one shared near arena, hook.rs).
     hook::log_arena();
 

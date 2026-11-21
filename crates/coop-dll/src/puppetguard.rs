@@ -55,12 +55,22 @@ const CHR_NET_ID: usize = 0x78;
 
 static TRAMP: AtomicUsize = AtomicUsize::new(0);
 static SKIPPED: AtomicU32 = AtomicU32::new(0);
+static DBLOCK_SKIPPED: AtomicU32 = AtomicU32::new(0);
 /// Puppets logged (ChrIns address); cleared never: a few entries per session.
 static LOGGED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+/// Deathblow-locked chrs logged (ChrIns address); bounded to avoid unbounded growth.
+static DBLOCK_LOGGED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 /// Skip this setter call? Only the type-5 apply, only for a puppet here.
 pub fn skip_type5_hp(enabled: bool, caller_rva: usize, puppet: impl FnOnce() -> bool) -> bool {
     enabled && caller_rva == TYPE5_SET_HP_RET && puppet()
+}
+
+/// Skip this setter call when Type 5 is applying remote HP onto an enemy/boss whose
+/// deathblow lock is currently held by our local player (prevents the host's stale
+/// Type-5 HP=1 from overwriting a joiner's finishing blow).
+pub fn skip_type5_for_deathblow(caller_rva: usize, our_lock: bool) -> bool {
+    caller_rva == TYPE5_SET_HP_RET && our_lock
 }
 
 extern "C" fn set_hp_detour(data: usize, hp: i32, caller: usize) -> u64 {
@@ -73,6 +83,24 @@ extern "C" fn set_hp_detour(data: usize, hp: i32, caller: usize) -> u64 {
         SKIPPED.fetch_add(1, Ordering::Relaxed);
         if let Some(chr) = puppet {
             note(chr, data, hp);
+        }
+        return 0;
+    }
+    if skip_type5_for_deathblow(caller_rva, crate::nsession::dblock::our_any_active())
+        && let Some(chr) = game::read_ptr(data + DATA_OWNER)
+        && let Some(net) = game::read::<u16>(chr + CHR_NET_ID)
+        && crate::nsession::dblock::our_lock_active(net)
+    {
+        let n = DBLOCK_SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut g) = DBLOCK_LOGGED.try_lock() {
+            let set = g.get_or_insert_with(HashSet::new);
+            if set.len() < 128 && set.insert(chr) {
+                let entity = game::Chr(chr).entity_id().unwrap_or(-1);
+                let kept = game::read::<i32>(data + DATA_HP).unwrap_or(-1);
+                log::line(&format!(
+                    "type5: enemy {entity} netId {net:#x} under our active deathblow lock: owner's HP {hp} ignored, kept {kept} ({n} deathblow type-5 writes skipped)"
+                ));
+            }
         }
         return 0;
     }
@@ -168,5 +196,12 @@ mod tests {
             true
         }));
         assert!(!asked, "the SpEffect walk must not run on every HP write");
+    }
+
+    #[test]
+    fn type5_skipped_only_when_our_deathblow_lock_active() {
+        assert!(skip_type5_for_deathblow(TYPE5_SET_HP_RET, true));
+        assert!(!skip_type5_for_deathblow(TYPE5_SET_HP_RET, false));
+        assert!(!skip_type5_for_deathblow(0x9EE802, true));
     }
 }

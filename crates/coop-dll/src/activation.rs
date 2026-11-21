@@ -23,8 +23,8 @@ use crate::peers::MAX_PEERS;
 const SETTER_RVA: usize = 0x9F6270;
 const SETTER_PROLOGUE: [u8; 7] = [0xF6, 0x81, 0x10, 0x1A, 0x00, 0x00, 0x01];
 const ENEMY_VTABLE_RVA: usize = 0x2A27F28;
-const RADIUS_M: f32 = 40.0;
-const MAX_FORCED: u32 = 16;
+const RADIUS_M: f32 = 75.0;
+const MAX_FORCED: u32 = 24;
 
 /// How many entries of `PEER_POS` are live (0 = no peer: the rule is off).
 static PEER_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -174,12 +174,12 @@ mod tests {
 
     #[test]
     fn rule_covers_every_peer_position() {
-        set_peers(&[[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]]);
+        set_peers(&[[0.0, 0.0, 0.0], [200.0, 0.0, 0.0]]);
         let n = PEER_COUNT.load(Ordering::Acquire);
         assert_eq!(n, 2);
-        assert!(near_a_peer([10.0, 0.0, 0.0], n));
-        assert!(near_a_peer([90.0, 0.0, 0.0], n));
-        assert!(!near_a_peer([50.0, 0.0, 0.0], n));
+        assert!(near_a_peer([65.0, 0.0, 0.0], n));
+        assert!(near_a_peer([180.0, 0.0, 0.0], n));
+        assert!(!near_a_peer([100.0, 0.0, 0.0], n));
         // More than MAX_PEERS: the rest are ignored.
         set_peers(&[[0.0; 3]; MAX_PEERS + 2]);
         assert_eq!(PEER_COUNT.load(Ordering::Acquire), MAX_PEERS);

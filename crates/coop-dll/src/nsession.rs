@@ -1570,6 +1570,9 @@ fn serve(t: u32, buf: *mut u8, cap: u32) -> i32 {
     let Ok(mut g) = INBOX.try_lock() else { return 0 };
     let Some(q) = g.get_mut(t as usize) else { return 0 };
     while let Some((origin, mut p)) = q.pop_front() {
+        if !allow_packet_route(t) {
+            continue;
+        }
         if p.is_empty() || p.len() > cap as usize {
             bump(&BIG, t);
             continue;
@@ -1759,6 +1762,11 @@ pub fn claims_wanted() -> bool {
     OWNS_ENEMIES.load(Ordering::Relaxed)
 }
 
+/// True while native session owns enemies and stage 4 (Type 45 ObjAct sync) is active.
+pub fn obj_event_active() -> bool {
+    OWNS_ENEMIES.load(Ordering::Acquire) && tuning::native_session_stage() >= 4
+}
+
 fn list_22(d: &[u8]) -> Option<Vec<u32>> {
     parse_22(d)?;
     Some(d[4..].chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
@@ -1814,9 +1822,20 @@ fn strip_22(d: &[u8], claims: &[u16], won: &[u16]) -> Option<(Vec<u8>, usize)> {
     Some((encode_22(&kept), n))
 }
 
+/// Native Type 45 (ObjAct) blindly replays non-door interactions (treasure chests,
+/// Shinobi Axe shrine, palanquin) onto peers and locks them out of looting/interacting.
+/// Persistent doors stay synced through `doors.rs` (`EV_OBJACT`), so Type 45 is suppressed
+/// here while preserving stage-4 handshake compatibility.
+pub fn allow_packet_route(t: u32) -> bool {
+    t != T_OBJ_EVENT as u32
+}
+
 /// Copies an outgoing game packet into our outbox. True = handled (the game's
 /// own send is not run: with an empty member vector it would send nothing).
 fn route_send(t: u32, data: *const u8, size: u32, dst: Dst) -> bool {
+    if !allow_packet_route(t) {
+        return true;
+    }
     let size = size as usize;
     if size == 0 || size > MAX_GAME_PACKET {
         bump(&BIG, t);
@@ -2465,19 +2484,6 @@ fn owned_ids() -> Vec<u16> {
     v
 }
 
-/// netIds of the loaded boss members (table bosses and enemies with two or more lives, as
-/// ownfill's boss rule counts them).
-fn boss_net_ids() -> Vec<u16> {
-    enemies()
-        .into_iter()
-        .filter(|&c| {
-            c.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some())
-                || crate::livesync::multi_life(crate::livesync::lives0_of(c))
-        })
-        .filter_map(netai::net_id)
-        .collect()
-}
-
 /// Marker in an Owned list: "our world update is paused (menu), the enemies near you that
 /// we owned are left out of this list". Sorts after every real netId (`NO_NET_ID` is 0xFFFF);
 /// an older peer sees an id no enemy has.
@@ -3038,16 +3044,31 @@ pub(crate) mod ownfill {
     const OWNED_HERE_PROLOGUE: [u8; 11] = [0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x89, 0x30, 0x06, 0x00, 0x00];
     static TRAMP: AtomicUsize = AtomicUsize::new(0);
     static ANY: AtomicBool = AtomicBool::new(false);
+    static SPECTATE_YIELD: AtomicBool = AtomicBool::new(false);
     static BITS: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
 
-    pub const NEAR_M: f32 = 40.0;
-    /// Hysteresis (live 2026-10-24: "taken 127, given back 112" for enemies 40-48 m away):
-    /// we take at <= `NEAR_M`, and let one go only beyond `NEAR_M + GIVE_BACK_EXTRA_M` ...
-    pub const GIVE_BACK_EXTRA_M: f32 = 8.0;
+    pub fn set_spectate_yield(on: bool) {
+        SPECTATE_YIELD.store(on, Ordering::Release);
+    }
+
+    pub fn is_player_net(n: u16) -> bool {
+        if n == NO_NET_ID {
+            return false;
+        }
+        PNET.iter().chain(PNET_ALT.iter()).any(|a| a.load(Ordering::Relaxed) == n)
+    }
+
+    pub fn should_yield_owned_here(yield_on: bool, mod_alive: bool, n: u16, is_player: bool) -> bool {
+        yield_on && mod_alive && n != NO_NET_ID && !is_player
+    }
+
+    pub const NEAR_M: f32 = 75.0;
+    /// Hysteresis: we take at <= `NEAR_M`, and let one go only beyond `NEAR_M + GIVE_BACK_EXTRA_M` ...
+    pub const GIVE_BACK_EXTRA_M: f32 = 12.0;
     const FAR_M: f32 = NEAR_M + GIVE_BACK_EXTRA_M;
     /// ... that stayed beyond (no longer `keep`) for this long without a break.
     pub const GIVE_BACK_AFTER: Duration = Duration::from_secs(5);
-    const TIE_M: f32 = 5.0;
+    const TIE_M: f32 = 10.0;
     const HOST_CONFLICT_DROP: Duration = Duration::from_secs(3);
 
     fn bit(n: u16) -> (usize, u64) {
@@ -3077,7 +3098,11 @@ pub(crate) mod ownfill {
     }
 
     extern "C" fn detour(w: usize, n: u16) -> u8 {
-        if forced(n) && crate::mod_alive() {
+        let alive = crate::mod_alive();
+        if should_yield_owned_here(SPECTATE_YIELD.load(Ordering::Acquire), alive, n, is_player_net(n)) {
+            return 0;
+        }
+        if forced(n) && alive {
             return 1;
         }
         game_owned(w, n)
@@ -3227,7 +3252,9 @@ pub(crate) mod ownfill {
     impl Fill {
         pub fn reset(&mut self) {
             clear_all();
+            set_spectate_yield(false);
             set_boss_forced(Vec::new());
+            set_client_stealth_miniboss(Vec::new());
             self.ours.clear();
             self.native.clear();
             self.diag_at.clear();
@@ -3276,6 +3303,12 @@ pub(crate) mod ownfill {
                 c.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some())
                     || crate::livesync::multi_life(crate::livesync::lives0_of(c))
             };
+            let yielded = if me == 0 {
+                CLIENT_STEALTH_MINIBOSS.try_lock().map(|g| g.clone()).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let gauge = crate::game::boss_state().map(|b| b.entity);
             // We wait dead in a boss fight: a living player owns the boss (it gets the deathblow).
             let me_down = crate::bossrules::spectating();
             let down = crate::world::down_slots();
@@ -3296,6 +3329,10 @@ pub(crate) mod ownfill {
                     drop.push((n, "dead or unloaded"));
                     continue;
                 };
+                if me_down {
+                    drop.push((n, "we are dead (spectating): a living player takes it"));
+                    continue;
+                }
                 let (d_me, ds) = dists(p);
                 // Keep active Puppeteer Ninjutsu puppets under their caster's local AI.
                 if d_me <= 60.0 && crate::statelog::owner_team_state(c.0).is_some_and(|(_, on)| on) {
@@ -3304,6 +3341,15 @@ pub(crate) mod ownfill {
                     continue;
                 }
                 let boss = is_boss(c);
+                if me == 0
+                    && boss
+                    && yielded.binary_search(&n).is_ok()
+                    && !dblock::our_lock_active(n)
+                    && chr_is_client_yieldable_boss(c, gauge)
+                {
+                    drop.push((n, "client stealth approach on unengaged miniboss"));
+                    continue;
+                }
                 let go = game_owned(w, n);
                 if boss {
                     let old = self.native.insert(n, go);
@@ -3316,10 +3362,6 @@ pub(crate) mod ownfill {
                             old.unwrap_or(0)
                         ));
                     }
-                }
-                if boss && me_down {
-                    drop.push((n, "we are dead (spectating): a living player takes it"));
-                    continue;
                 }
                 if go != 0 && drop_on_native(me, boss) {
                     drop.push((n, "the game gives it to us now"));
@@ -3335,7 +3377,8 @@ pub(crate) mod ownfill {
                     continue;
                 }
                 *conflict = None;
-                let kept = if boss { keep_boss(me, d_me, &boss_rivals(&ds, down)) } else { keep(me, d_me, &ds) };
+                let rivals = boss_rivals(&ds, down);
+                let kept = if boss { keep_boss(me, d_me, &rivals) } else { keep(me, d_me, &rivals) };
                 if kept {
                     *beyond = None;
                 } else if give_back_due(Some(now.duration_since(*beyond.get_or_insert(now)))) {
@@ -3382,64 +3425,106 @@ pub(crate) mod ownfill {
             }
             self.cooldown.retain(|_, t| now.duration_since(*t) < RETAKE_COOLDOWN);
             self.give_log_at.retain(|_, t| now.duration_since(*t) < Duration::from_secs(60));
-            // New ones: alive, near, nobody owns them.
-            for (&n, &(c, p)) in &alive_ids {
-                let (d_me, ds) = dists(p);
-                let puppet = d_me <= 60.0 && crate::statelog::owner_team_state(c.0).is_some_and(|(_, on)| on);
-                if !puppet && self.cooldown.contains_key(&n) {
-                    continue;
-                }
-                let boss = is_boss(c);
-                if boss && me_down {
-                    continue;
-                }
-                let host_boss = me == 0 && boss;
-                if self.ours.contains_key(&n) || (!puppet && ((game_owned(w, n) != 0 && !host_boss) || !owners_of(n).is_empty())) {
-                    continue;
-                }
-                let take = if puppet {
-                    true
-                } else if boss {
-                    wanted_boss(me, d_me, &boss_rivals(&ds, down))
-                } else {
-                    wanted(me, d_me, &ds)
-                };
-                if !take {
-                    continue;
-                }
-                set(n, true);
-                let e = c.entity_id().unwrap_or(-1);
-                if boss {
-                    self.native.insert(n, game_owned(w, n));
+            // New ones: alive, near, nobody owns them (never while spectating dead).
+            if !me_down {
+                for (&n, &(c, p)) in &alive_ids {
+                    let (d_me, ds) = dists(p);
+                    let puppet = d_me <= 60.0 && crate::statelog::owner_team_state(c.0).is_some_and(|(_, on)| on);
+                    if !puppet && self.cooldown.contains_key(&n) {
+                        continue;
+                    }
+                    let boss = is_boss(c);
+                    if me == 0
+                        && boss
+                        && yielded.binary_search(&n).is_ok()
+                        && !dblock::our_lock_active(n)
+                        && chr_is_client_yieldable_boss(c, gauge)
+                    {
+                        continue;
+                    }
+                    let host_boss = me == 0 && boss;
+                    if self.ours.contains_key(&n) || (!puppet && ((game_owned(w, n) != 0 && !host_boss) || !owners_of(n).is_empty())) {
+                        continue;
+                    }
+                    let rivals = boss_rivals(&ds, down);
+                    let take = if puppet {
+                        true
+                    } else if boss {
+                        wanted_boss(me, d_me, &rivals)
+                    } else {
+                        wanted(me, d_me, &rivals)
+                    };
+                    if !take {
+                        continue;
+                    }
+                    set(n, true);
+                    let e = c.entity_id().unwrap_or(-1);
+                    if boss {
+                        self.native.insert(n, game_owned(w, n));
+                        self.log(format!(
+                            "ownfill: BOSS (boss) netId {n:#x} ent {e} take why=wanted_boss game_owned={} forced={} d_me={d_me:.0} others={:?} pos={p:?} hp={:?} owners=[]",
+                            game_owned(w, n),
+                            forced(n),
+                            ds,
+                            c.hp()
+                        ));
+                    }
+                    self.ours.insert(n, (e, now, None, None));
+                    self.taken += 1;
+                    let near = ds.iter().filter_map(|&(_, d)| d).fold(f32::MAX, f32::min);
+                    let tag = if is_boss(c) { " (boss)" } else { "" };
                     self.log(format!(
-                        "ownfill: BOSS (boss) netId {n:#x} ent {e} take why=wanted_boss game_owned={} forced={} d_me={d_me:.0} others={:?} pos={p:?} hp={:?} owners=[]",
-                        game_owned(w, n),
-                        forced(n),
-                        ds,
-                        c.hp()
+                        "ownfill: enemy {e}{tag} netId {n:#x} owned by nobody, {d_me:.0} m from us, {} from the nearest other player (interval {:?}): runs here now",
+                        if near < f32::MAX { format!("{near:.0} m") } else { "?".to_string() },
+                        read::<i32>(c.0 + 0x110)
                     ));
                 }
-                self.ours.insert(n, (e, now, None, None));
-                self.taken += 1;
-                let near = ds.iter().filter_map(|&(_, d)| d).fold(f32::MAX, f32::min);
-                let tag = if is_boss(c) { " (boss)" } else { "" };
-                self.log(format!(
-                    "ownfill: enemy {e}{tag} netId {n:#x} owned by nobody, {d_me:.0} m from us, {} from the nearest other player (interval {:?}): runs here now",
-                    if near < f32::MAX { format!("{near:.0} m") } else { "?".to_string() },
-                    read::<i32>(c.0 + 0x110)
-                ));
             }
             // Host: publish the boss members we hold forced (`host_candidates` strips them
-            // from every client's candidate list).
+            // from every client's candidate list). Clear immediately while spectating dead.
             if me == 0 {
-                let held: Vec<u16> = self
-                    .ours
-                    .iter()
-                    .filter(|&(n, v)| crate::bosses::encounter_of(v.0).is_some() || alive_ids.get(n).is_some_and(|&(c, _)| is_boss(c)))
-                    .map(|(&n, _)| n)
-                    .collect();
+                let held: Vec<u16> = if me_down {
+                    Vec::new()
+                } else {
+                    self.ours
+                        .iter()
+                        .filter(|&(n, v)| {
+                            let boss = crate::bosses::encounter_of(v.0).is_some()
+                                || alive_ids.get(n).is_some_and(|&(c, _)| is_boss(c));
+                            let yielded_now = yielded.binary_search(n).is_ok()
+                                && !dblock::our_lock_active(*n)
+                                && alive_ids.get(n).is_some_and(|&(c, _)| chr_is_client_yieldable_boss(c, gauge));
+                            boss && !yielded_now
+                        })
+                        .map(|(&n, _)| n)
+                        .collect()
+                };
                 set_boss_forced(held);
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod spectate_yield_tests {
+        use super::*;
+
+        #[test]
+        fn spectate_yield_only_drops_non_player_enemies() {
+            assert!(should_yield_owned_here(true, true, 0x0812, false));
+            assert!(!should_yield_owned_here(false, true, 0x0812, false));
+            assert!(!should_yield_owned_here(true, false, 0x0812, false));
+            assert!(!should_yield_owned_here(true, true, NO_NET_ID, false));
+            assert!(!should_yield_owned_here(true, true, 0xA000, true));
+        }
+
+        #[test]
+        fn ordinary_enemies_ignore_down_spectating_peers() {
+            let ds = [(0u8, Some(1.5)), (1u8, Some(8.0))];
+            let down = 1u32 << 0; // Host slot 0 is dead/spectating right on top of the enemy.
+            let rivals = boss_rivals(&ds, down);
+            assert!(!wanted(1, 8.0, &ds));
+            assert!(wanted(1, 8.0, &rivals));
+            assert!(keep(1, 8.0, &rivals));
         }
     }
 }
@@ -3448,6 +3533,9 @@ pub(crate) mod ownfill {
 /// type-22 candidate list still names them, so the game's distribution kept handing the
 /// same boss to the friend (live 2026-10-26: `claimed by both machines`).
 static BOSS_FORCED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+/// Untouched non-table minibosses & Great Serpent currently yielded to a client's stealth
+/// / event claim so joiners can land opening deathblows without `BOSS_FORCED` fighting them.
+static CLIENT_STEALTH_MINIBOSS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
 static STRIPPED_BOSS: AtomicU32 = AtomicU32::new(0);
 
 fn set_boss_forced(mut v: Vec<u16>) {
@@ -3455,6 +3543,47 @@ fn set_boss_forced(mut v: Vec<u16>) {
     if let Ok(mut g) = BOSS_FORCED.lock() {
         *g = v;
     }
+}
+
+fn set_client_stealth_miniboss(mut v: Vec<u16>) {
+    v.sort_unstable();
+    v.dedup();
+    if let Ok(mut g) = CLIENT_STEALTH_MINIBOSS.lock() {
+        *g = v;
+    }
+}
+
+/// Pure eligibility rule for temporarily yielding a host-forced boss/miniboss netId to a
+/// client's stealth or scripted-event claim: Great Serpent (`c5010`) or an untouched
+/// non-table miniboss (`enemies::unengaged_miniboss`). Main table bosses are never yielded.
+pub(crate) fn is_client_yieldable_boss(
+    table_boss: bool,
+    char_id: Option<i32>,
+    is_gauge: bool,
+    lives0: i32,
+    lives: i32,
+    hp: i32,
+    max_hp: i32,
+    posture: i32,
+    max_posture: i32,
+) -> bool {
+    char_id == Some(crate::enemies::SERPENT_CHAR_ID)
+        || crate::enemies::unengaged_miniboss(table_boss, is_gauge, lives0, lives, hp, max_hp, posture, max_posture)
+}
+
+fn chr_is_client_yieldable_boss(chr: Chr, gauge: Option<i32>) -> bool {
+    let char_id = chr.character_id();
+    if char_id == Some(crate::enemies::SERPENT_CHAR_ID) {
+        return is_client_yieldable_boss(false, char_id, false, 1, 1, 1, 1, 0, 0);
+    }
+    let table_boss = chr.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some());
+    let is_gauge = gauge.is_some() && chr.entity_id() == gauge;
+    let lives0 = crate::livesync::lives0_of(chr);
+    let Some((data, hp, max_hp, max_posture, lives)) = crate::livesync::read_data(chr) else {
+        return false;
+    };
+    let posture = crate::livesync::read_posture(data).unwrap_or(max_posture);
+    is_client_yieldable_boss(table_boss, char_id, is_gauge, lives0, lives, hp, max_hp, posture, max_posture)
 }
 
 /// The netIds a client may not keep: the contested / claimed ones (`base`) plus the
@@ -3705,8 +3834,12 @@ pub(crate) mod dblock {
     use super::*;
 
     /// A deathblow holds its enemy this long after the holder's latest type 18 (the two
-    /// packets of one deathblow, e.g. 1200 / 1205, come within ~1 s; the animation ~3 s).
+    /// packets of one deathblow, e.g. 1200 / 1205, come within ~1 s; longer boss / Great
+    /// Serpent animations are kept alive while `throw_active` up to `MAX_LOCK_MS`).
     pub const LOCK_MS: u64 = 4000;
+    /// Maximum hold for a single continuous deathblow execution (matches `BOSS_THROW_WAIT`).
+    pub const MAX_LOCK_MS: u64 = 12_000;
+    pub const EXTEND_STEP_MS: u64 = 1000;
     /// Two starts closer than this (after the latency estimate) are a tie: the host's wins.
     pub const TIE_MS: u64 = 120;
     /// RTT assumed until the link has measured one.
@@ -3877,6 +4010,18 @@ pub(crate) mod dblock {
             }
         }
 
+        /// Extends active locks whose enemy is still playing a throw animation, capped at `MAX_LOCK_MS`.
+        pub fn keep_alive(&mut self, now: u64, is_throwing: impl Fn(u16) -> bool) {
+            for l in &mut self.locks {
+                if now < l.until && is_throwing(l.net) {
+                    let cap = l.start.saturating_add(MAX_LOCK_MS);
+                    if now < cap {
+                        l.until = l.until.max(now.saturating_add(EXTEND_STEP_MS).min(cap));
+                    }
+                }
+            }
+        }
+
         /// Drops the locks that ran out; returns them.
         pub fn expire(&mut self, now: u64) -> Vec<Lock> {
             let (gone, kept): (Vec<Lock>, Vec<Lock>) = self.locks.iter().partition(|l| now >= l.until);
@@ -3891,6 +4036,9 @@ pub(crate) mod dblock {
     /// netIds another player holds (read by the gate detour on game threads: atomics only).
     static ANY: AtomicBool = AtomicBool::new(false);
     static BITS: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+    /// netIds currently held by `Holder::Us` (read by `puppetguard.rs` to protect our deathblows).
+    static OUR_ANY: AtomicBool = AtomicBool::new(false);
+    static OUR_BITS: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
     /// Vetoes already queued for a log line during the current lock.
     static LOGGED: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
     static PENDING_LOG: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
@@ -3929,6 +4077,17 @@ pub(crate) mod dblock {
         ANY.load(Ordering::Acquire) && BITS[i].load(Ordering::Relaxed) & m != 0
     }
 
+    /// Fast lock-free check for `puppetguard.rs`: true while any local deathblow lock is active.
+    pub fn our_any_active() -> bool {
+        OUR_ANY.load(Ordering::Acquire)
+    }
+
+    /// True while our player actively holds the deathblow lock for `n`.
+    pub fn our_lock_active(n: u16) -> bool {
+        let (i, m) = bit(n);
+        OUR_ANY.load(Ordering::Acquire) && OUR_BITS[i].load(Ordering::Relaxed) & m != 0
+    }
+
     fn set_peer(n: u16, on: bool) {
         let (i, m) = bit(n);
         if on {
@@ -3938,6 +4097,28 @@ pub(crate) mod dblock {
             BITS[i].fetch_and(!m, Ordering::Relaxed);
             LOGGED[i].fetch_and(!m, Ordering::Relaxed);
         }
+    }
+
+    fn set_ours(n: u16, on: bool) {
+        let (i, m) = bit(n);
+        if on {
+            OUR_BITS[i].fetch_or(m, Ordering::Relaxed);
+            OUR_ANY.store(true, Ordering::Release);
+        } else {
+            OUR_BITS[i].fetch_and(!m, Ordering::Relaxed);
+        }
+    }
+
+    /// World reset: drops every deathblow lock so stale locks never leak across loads/warps.
+    pub fn reset() {
+        if let Ok(mut g) = TABLE.try_lock() {
+            for l in g.locks.drain(..) {
+                set_peer(l.net, false);
+                set_ours(l.net, false);
+            }
+        }
+        ANY.store(false, Ordering::Release);
+        OUR_ANY.store(false, Ordering::Release);
     }
 
     fn log_limited(s: String) {
@@ -4018,10 +4199,11 @@ pub(crate) mod dblock {
         let Ok(mut g) = TABLE.try_lock() else { return };
         match g.on_ours(n, now) {
             Ours::New => {
+                set_ours(n, true);
                 OURS_NEW.fetch_add(1, Ordering::Relaxed);
                 log_limited(format!("deathblow: enemy {n:#x} locked by us (our throw {id}, {} s; the other players' attempts on it will not start)", LOCK_MS / 1000));
             }
-            Ours::Held => {}
+            Ours::Held => set_ours(n, true),
             Ours::PeerHolds(l) => {
                 MISSED.fetch_add(1, Ordering::Relaxed);
                 log_limited(format!(
@@ -4077,6 +4259,7 @@ pub(crate) mod dblock {
                 ));
             }
             Theirs::PeerFirst { lead, tie } => {
+                set_ours(n, false);
                 set_peer(n, true);
                 GAVE_WAY.fetch_add(1, Ordering::Relaxed);
                 log_limited(format!(
@@ -4095,6 +4278,7 @@ pub(crate) mod dblock {
                 ));
             }
             Theirs::Verdict(prev) => {
+                set_ours(n, false);
                 set_peer(n, true);
                 if prev == Holder::Us {
                     GAVE_WAY.fetch_add(1, Ordering::Relaxed);
@@ -4119,14 +4303,49 @@ pub(crate) mod dblock {
             return;
         }
         let now = crate::game::now_ms();
+        // Snapshot currently active locked netIds outside `TABLE` before reading enemy chrs
+        // so we never scan `enemies()` when idle and never hold `TABLE` across enemy scans.
+        let active_nets: Vec<u16> = TABLE
+            .try_lock()
+            .map(|g| g.locks.iter().filter(|l| now < l.until).map(|l| l.net).collect())
+            .unwrap_or_default();
+        let throwing: Vec<u16> = if active_nets.is_empty() {
+            Vec::new()
+        } else {
+            enemies()
+                .into_iter()
+                .filter_map(|c| {
+                    let n = netai::net_id(c)?;
+                    (active_nets.contains(&n) && crate::enemies::throw_active(c)).then_some(n)
+                })
+                .collect()
+        };
         if let Ok(mut g) = TABLE.try_lock() {
+            if !throwing.is_empty() {
+                g.keep_alive(now, |n| throwing.contains(&n));
+                let me_slot = ME.load(Ordering::Relaxed);
+                for l in &g.locks {
+                    if throwing.contains(&l.net)
+                        && let Holder::Peer(slot) = l.holder
+                        && (slot as usize) < SLOTS
+                        && slot != me_slot
+                    {
+                        REMOTE_THROW_UNTIL[slot as usize].fetch_max(now.saturating_add(EXTEND_STEP_MS), Ordering::Relaxed);
+                    }
+                }
+            }
             for l in g.expire(now) {
-                if l.holder != Holder::Us {
+                if l.holder == Holder::Us {
+                    set_ours(l.net, false);
+                } else {
                     set_peer(l.net, false);
                 }
             }
             if !g.locks.iter().any(|l| l.holder != Holder::Us) {
                 ANY.store(false, Ordering::Release);
+            }
+            if !g.locks.iter().any(|l| l.holder == Holder::Us) {
+                OUR_ANY.store(false, Ordering::Release);
             }
         }
         for s in &PENDING_LOG {
@@ -4768,6 +4987,7 @@ impl Engine {
     /// hooks pass through from here), then the patches out, the queues empty.
     fn teardown(&mut self) {
         set_owns(false);
+        ownfill::set_spectate_yield(false);
         ROUTE.store(false, Ordering::Release);
         ANY_MEMBER.store(false, Ordering::Release);
         set_whitelist(0);
@@ -5168,40 +5388,52 @@ impl Engine {
         l.busy_timeouts = 0;
         l.busy_retry_at = None;
         // Host death rule: alive on both = the lower HP on both (nothing is healed).
+        // Never adopt lower HP while a wipe, recent death reload, or rest is still settling,
+        // so a fast-reloading peer never inherits pre-wipe damaged boss HP from a still-reloading peer.
         if l.stage >= 2 {
-            let ours = our_pairs();
-            let our_max: HashMap<i32, i32> = our_max_hp().into_iter().collect();
-            // This link's MaxHp for its List of this generation (§34).
-            let their_max: Option<HashMap<i32, i32>> = book().peers[l.slot() as usize]
-                .as_ref()
-                .and_then(|p| p.max_hp.as_ref())
-                .filter(|(g, _)| *g == pgen)
-                .map(|(_, m)| m.iter().copied().collect());
-            let raw = hp_adoptions_raw(&ours, theirs).len();
-            let adopt = hp_adoptions(&ours, &our_max, theirs, their_max.as_ref());
-            if raw > adopt.len() {
+            let skip_hp_adopt = crate::persist::wipe_active()
+                || crate::persist::after_death_guard(Duration::from_secs(15))
+                || crate::restsync::hold_kills();
+            if skip_hp_adopt {
                 log::line(&format!(
-                    "nsession: HP check on engage with peer {}: {} of {raw} lower HPs not taken (max HP differs or HP above max: scaling not settled on one side{})",
+                    "nsession: HP check on engage with peer {}: skipped (wipe/death/rest recent)",
+                    l.slot()
+                ));
+            } else {
+                let ours = our_pairs();
+                let our_max: HashMap<i32, i32> = our_max_hp().into_iter().collect();
+                // This link's MaxHp for its List of this generation (§34).
+                let their_max: Option<HashMap<i32, i32>> = book().peers[l.slot() as usize]
+                    .as_ref()
+                    .and_then(|p| p.max_hp.as_ref())
+                    .filter(|(g, _)| *g == pgen)
+                    .map(|(_, m)| m.iter().copied().collect());
+                let raw = hp_adoptions_raw(&ours, theirs).len();
+                let adopt = hp_adoptions(&ours, &our_max, theirs, their_max.as_ref());
+                if raw > adopt.len() {
+                    log::line(&format!(
+                        "nsession: HP check on engage with peer {}: {} of {raw} lower HPs not taken (max HP differs or HP above max: scaling not settled on one side{})",
+                        l.slot(),
+                        raw - adopt.len(),
+                        if their_max.is_none() { "; it sent no max HP" } else { "" }
+                    ));
+                }
+                let mut n = 0;
+                for &(e, hp) in &adopt {
+                    if let Some(c) = crate::game::chr_by_entity_id(e)
+                        && c.hp().is_some_and(|cur| cur > hp)
+                        // The game's setter (0xBD64E0, posture.rs), so a multi-life boss keeps its floor.
+                        && crate::posture::set_hp(c, hp)
+                    {
+                        n += 1;
+                    }
+                }
+                log::line(&format!(
+                    "nsession: HP check on engage with peer {}: {n} enemies took its lower HP{}",
                     l.slot(),
-                    raw - adopt.len(),
-                    if their_max.is_none() { "; it sent no max HP" } else { "" }
+                    if self.host { "" } else { "; from now on their HP follows the host (type 5)" }
                 ));
             }
-            let mut n = 0;
-            for &(e, hp) in &adopt {
-                if let Some(c) = crate::game::chr_by_entity_id(e)
-                    && c.hp().is_some_and(|cur| cur > hp)
-                    // The game's setter (0xBD64E0, posture.rs), so a multi-life boss keeps its floor.
-                    && crate::posture::set_hp(c, hp)
-                {
-                    n += 1;
-                }
-            }
-            log::line(&format!(
-                "nsession: HP check on engage with peer {}: {n} enemies took its lower HP{}",
-                l.slot(),
-                if self.host { "" } else { "; from now on their HP follows the host (type 5)" }
-            ));
         }
         if first {
             clear_queues();
@@ -5448,14 +5680,13 @@ impl Engine {
             && self.owned_check_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
         if self.stage >= 2 && (owned_due || owned_check) {
             self.owned_check_at = Some(now);
-            let mut ids = owned_ids();
-            ids.retain(|n| !self.handed.contains(n));
-            // v8.57: dead in a boss fight: the boss leaves our list like a paused hand-over, so a
-            // living player's ownfill takes it (the game kept it ours natively, live 2026-10-27).
-            if crate::bossrules::spectating() {
-                let bosses = boss_net_ids();
-                ids.retain(|n| !bosses.contains(n));
-            }
+            let mut ids = if crate::bossrules::spectating() {
+                Vec::new()
+            } else {
+                let mut v = owned_ids();
+                v.retain(|n| !self.handed.contains(n));
+                v
+            };
             if self.pause.active {
                 ids.push(OWNED_PAUSED_MARK);
             }
@@ -5612,8 +5843,11 @@ impl Engine {
                 None => bump(&DROP, T_CAND as u32),
             }
         }
-        let ours = claims_now();
-        let boss_forced: Vec<u16> = BOSS_FORCED.try_lock().map(|g| g.clone()).unwrap_or_default();
+        let (ours, boss_forced) = if crate::bossrules::spectating() {
+            (Vec::new(), Vec::new())
+        } else {
+            (claims_now(), BOSS_FORCED.try_lock().map(|g| g.clone()).unwrap_or_default())
+        };
         // Who claims what: us (slot 0) and each engaged client from its last list.
         let mut claimants: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
         for &n in &ours {
@@ -5638,6 +5872,38 @@ impl Engine {
             self.winners.retain(|n, _| contested.contains(n));
         }
         self.contested = contested;
+        // Untouched open-world minibosses & Great Serpent temporarily yield host `BOSS_FORCED`
+        // when an engaged client claims them and the host did not win a contest on them.
+        let mut client_claimed: Vec<u16> = self
+            .links
+            .values()
+            .filter(|l| l.phase == Phase::Engaged)
+            .flat_map(|l| l.claimed.iter().copied())
+            .collect();
+        client_claimed.sort_unstable();
+        client_claimed.dedup();
+        let client_yield: Vec<u16> = if client_claimed.is_empty() {
+            Vec::new()
+        } else {
+            let gauge = crate::game::boss_state().map(|b| b.entity);
+            let chrs: HashMap<u16, Chr> = enemies()
+                .into_iter()
+                .filter_map(|c| {
+                    let n = netai::net_id(c)?;
+                    (client_claimed.binary_search(&n).is_ok()).then_some((n, c))
+                })
+                .collect();
+            client_claimed
+                .into_iter()
+                .filter(|n| {
+                    !dblock::our_lock_active(*n)
+                        && (!ours.contains(n) || self.winners.get(n).is_some_and(|&w| w != PeerId::HOST.slot()))
+                        && chrs.get(n).is_some_and(|&c| chr_is_client_yieldable_boss(c, gauge))
+                })
+                .collect()
+        };
+        set_client_stealth_miniboss(client_yield.clone());
+        let effective_boss_forced: Vec<u16> = boss_forced.into_iter().filter(|n| !client_yield.contains(n)).collect();
         let mut any_change = false;
         let ids: Vec<PeerId> = self.links.iter().filter(|(_, l)| l.phase == Phase::Engaged).map(|(&id, _)| id).collect();
         for id in ids {
@@ -5647,8 +5913,8 @@ impl Engine {
             // netIds another machine won.
             let mut blocked: Vec<u16> = ours.iter().copied().filter(|n| self.winners.get(n).is_none_or(|&w| w != slot)).collect();
             blocked.extend(self.winners.iter().filter(|&(n, &w)| w != slot && !ours.contains(n)).map(|(&n, _)| n));
-            // The host's forced boss members: the client's list must not keep them either.
-            let blocked = blocked_with_bosses(blocked, &boss_forced);
+            // The host's forced boss members (minus yielded unengaged minibosses): the client's list must not keep them.
+            let blocked = blocked_with_bosses(blocked, &effective_boss_forced);
             let Some(l) = self.links.get_mut(&id) else { continue };
             let changed = blocked != l.blocked;
             any_change |= changed;
@@ -5662,8 +5928,8 @@ impl Engine {
                 if !l.blocked.is_empty()
                     && let Some((kept, n)) = strip_22(&p, &l.blocked, &l.blocked)
                 {
-                    if !boss_forced.is_empty() {
-                        let nb = list_22(&p).map_or(0, |v| v.iter().filter(|&&x| boss_forced.contains(&((x & 0xFFFF) as u16))).count());
+                    if !effective_boss_forced.is_empty() {
+                        let nb = list_22(&p).map_or(0, |v| v.iter().filter(|&&x| effective_boss_forced.contains(&((x & 0xFFFF) as u16))).count());
                         STRIPPED_BOSS.fetch_add(nb as u32, Ordering::Relaxed);
                     }
                     p = kept;
@@ -5930,6 +6196,7 @@ impl Engine {
             if self.links.values().any(|l| l.phase != Phase::Idle) {
                 self.disengage_all("link down", Reason::Other, false, false);
             }
+            ownfill::set_spectate_yield(false);
             OWNS_ENEMIES.store(false, Ordering::Relaxed);
             return;
         }
@@ -5998,7 +6265,10 @@ impl Engine {
             self.own_sync = own_sync;
         }
         if self.any_engaged() {
+            ownfill::set_spectate_yield(crate::bossrules::spectating());
             self.engaged_common(f);
+        } else {
+            ownfill::set_spectate_yield(false);
         }
         // Review #5: our own enemy sync runs until the session is ENGAGED (and from the
         // moment it disengages), so there is never a window with neither. Handover: the
@@ -6151,6 +6421,8 @@ pub fn on_rest(why: &str) {
 /// puppet.rs `invalidate_world` (load, our warp, player re-created): everything out
 /// before the world goes; the next world starts new handshakes (and netId checks).
 pub fn on_world_reset(why: &str) {
+    dblock::reset();
+    set_client_stealth_miniboss(Vec::new());
     let mut g = engine();
     let Some(e) = g.as_mut() else { return };
     e.disengage_all(why, Reason::Load, true, false);
@@ -6698,6 +6970,10 @@ mod tests {
         }
         assert_eq!(s3 >> T_OBJ_EVENT & 1, 0, "object events (45) are stage 4");
         assert_eq!(whitelist(4) >> T_OBJ_EVENT & 1, 1);
+        assert!(!allow_packet_route(T_OBJ_EVENT as u32), "Type 45 is suppressed at route_send/serve");
+        for &t in STAGE2_TYPES.iter().chain(STAGE3_TYPES.iter()) {
+            assert!(allow_packet_route(t as u32), "packet type {t} should remain routed");
+        }
         assert!(!reliable(T_MOVE) && !reliable(T_HP) && reliable(T_BEHAVIOR) && reliable(T_OWNERS) && reliable(T_DAMAGE));
         assert_eq!((lane_class(T_OWNERS), lane_class(T_DAMAGE), lane_class(T_BEHAVIOR)), (0, 1, 2));
         assert_eq!(queue_cap(T_MOVE), 32);
@@ -7040,30 +7316,30 @@ mod tests {
         // Live 7.4 friend line: 1100237 NetAI 7 m from the friend (client), 394 m from the host.
         assert!(client(7.0, Some(394.0)));
         assert!(!host(394.0, Some(7.0)));
-        // Both near: the nearer one; within 5 m of each other the host.
-        for (dh, dc) in [(10.0, 30.0), (30.0, 10.0), (20.0, 22.0), (22.0, 20.0), (20.0, 25.5), (35.0, 35.0), (25.0, 20.0)] {
+        // Both near: the nearer one; within 10 m of each other the host.
+        for (dh, dc) in [(10.0, 30.0), (30.0, 10.0), (20.0, 22.0), (22.0, 20.0), (20.0, 30.5), (35.0, 35.0), (65.0, 20.0)] {
             let (h, c) = (host(dh, Some(dc)), client(dc, Some(dh)));
             assert!(!(h && c), "both take it at host {dh} m / client {dc} m");
             assert!(h || c || dh.min(dc) > NEAR_M, "nobody takes it at host {dh} m / client {dc} m");
-            assert_eq!(h, dh <= NEAR_M && dh <= dc + 5.0, "host at {dh} / {dc}");
-            assert_eq!(c, dc <= NEAR_M && dc + 5.0 < dh, "client at {dc} / {dh}");
+            assert_eq!(h, dh <= NEAR_M && dh <= dc + 10.0, "host at {dh} / {dc}");
+            assert_eq!(c, dc <= NEAR_M && dc + 10.0 < dh, "client at {dc} / {dh}");
         }
         // Too far from both: nobody (the game's own LOD).
-        assert!(!host(60.0, Some(80.0)) && !client(80.0, Some(60.0)));
+        assert!(!host(80.0, Some(100.0)) && !client(100.0, Some(80.0)));
         // No position of the other: only the host.
         assert!(host(10.0, None) && !client(10.0, None));
-        // Hysteresis: a taken enemy stays a little past the rule (host up to 10 m farther,
+        // Hysteresis: a taken enemy stays a little past the rule (host up to 20 m farther,
         // the client while nearer).
-        assert!(keep(0, 28.0, &[(1, Some(20.0))]) && !host(28.0, Some(20.0)));
-        assert!(!keep(0, 31.0, &[(1, Some(20.0))]));
+        assert!(keep(0, 38.0, &[(1, Some(20.0))]) && !host(38.0, Some(20.0)));
+        assert!(!keep(0, 41.0, &[(1, Some(20.0))]));
         assert!(keep(1, 19.0, &[(0, Some(20.0))]) && !keep(1, 20.0, &[(0, Some(20.0))]));
-        assert!(!keep(0, 55.0, &[(1, Some(70.0))]));
+        assert!(!keep(0, 90.0, &[(1, Some(110.0))]));
     }
 
     #[test]
     fn ownfill_nearest_player_takes_it_tie_lowest_slot() {
         use super::ownfill::{conflict_drop, wanted};
-        // Every slot asks with the same distances: exactly one may take it (within 40 m).
+        // Every slot asks with the same distances: exactly one may take it (within 75 m).
         let takers = |d: &[(u8, f32)]| -> Vec<u8> {
             d.iter()
                 .filter(|&&(me, dm)| {
@@ -7077,19 +7353,19 @@ mod tests {
         assert_eq!(takers(&[(0, 90.0), (1, 12.0), (2, 8.0), (3, 30.0)]), vec![2]);
         // A tie between clients: the lowest slot.
         assert_eq!(takers(&[(0, 90.0), (2, 10.0), (3, 10.0), (5, 10.0)]), vec![2]);
-        // The host's 5 m bias: it wins a tie band against every client.
-        assert_eq!(takers(&[(0, 14.0), (1, 10.0), (2, 9.5)]), vec![0]);
-        assert_eq!(takers(&[(0, 15.0), (1, 10.0), (2, 9.9)]), vec![2]);
+        // The host's 10 m bias: it wins a tie band against every client.
+        assert_eq!(takers(&[(0, 19.0), (1, 10.0), (2, 9.5)]), vec![0]);
+        assert_eq!(takers(&[(0, 20.0), (1, 10.0), (2, 9.9)]), vec![2]);
         // The 3-player cycle a pairwise rule would have (nobody takes it): one taker here.
         assert_eq!(takers(&[(0, 10.0), (1, 6.0), (2, 4.0)]).len(), 1);
         // A grid of distances: never two, never none within range.
-        let ds = [3.0f32, 5.0, 8.0, 10.0, 13.0, 15.0, 20.0, 35.0, 45.0];
+        let ds = [3.0f32, 12.0, 25.0, 40.0, 55.0, 65.0, 90.0];
         for &a in &ds {
             for &b in &ds {
                 for &c in &ds {
                     let t = takers(&[(0, a), (1, b), (4, c)]);
                     assert!(t.len() <= 1, "{a} {b} {c}: {t:?}");
-                    assert!(!t.is_empty() || a.min(b).min(c) > 40.0, "{a} {b} {c}: nobody");
+                    assert!(!t.is_empty() || a.min(b).min(c) > 75.0, "{a} {b} {c}: nobody");
                 }
             }
         }
@@ -7162,11 +7438,11 @@ mod tests {
     #[test]
     fn ownfill_hysteresis_no_flapping_at_the_threshold() {
         use super::ownfill::{GIVE_BACK_AFTER, give_back_due, keep, wanted};
-        // Alternating 39 / 41 m (250 ms steps, 10 s): taken once, never given back.
+        // Alternating 74 / 76 m (250 ms steps, 10 s): taken once, never given back.
         let (mut held, mut beyond, mut transfers) = (false, None::<Duration>, 0u32);
         for i in 0..40u32 {
-            let d = if i % 2 == 0 { 39.0 } else { 41.0 };
-            let others = [(1u8, Some(100.0f32))];
+            let d = if i % 2 == 0 { 74.0 } else { 76.0 };
+            let others = [(1u8, Some(150.0f32))];
             if held {
                 if keep(0, d, &others) {
                     beyond = None;
@@ -7184,10 +7460,13 @@ mod tests {
             }
         }
         assert!(transfers <= 1, "{transfers} transfers");
-        // Beyond 48 m only counts after 5 s without a break.
-        assert!(!keep(0, 49.0, &[(1, Some(100.0))]) && keep(0, 47.0, &[(1, Some(100.0))]));
+        // Beyond 87 m only counts after 5 s without a break.
+        assert!(!keep(0, 88.0, &[(1, Some(150.0))]) && keep(0, 86.0, &[(1, Some(150.0))]));
         assert!(!give_back_due(None) && !give_back_due(Some(Duration::from_millis(4750))));
         assert!(give_back_due(Some(GIVE_BACK_AFTER)));
+        // 65 m arena separation keeps enemy owned cleanly without flapping.
+        assert!(wanted(0, 65.0, &[(1, Some(120.0))]));
+        assert!(keep(0, 65.0, &[(1, Some(120.0))]));
     }
 
     #[test]
@@ -7578,6 +7857,35 @@ mod dblock_tests {
         }
         assert!(t.locks.len() <= 32);
         assert!(t.active(99, 1100).is_some());
+    }
+
+    #[test]
+    fn dblock_extends_while_throwing_up_to_max_lock() {
+        let mut t = Table::new();
+        assert_eq!(t.on_theirs(0x1234, 0, 1000, 950, false), Theirs::New);
+        assert_eq!(t.active(0x1234, 4999).map(|l| l.holder), Some(Holder::Peer(0)));
+        // Past LOCK_MS (4000 ms), periodic keep_alive ticks keep refreshing it while throwing,
+        // up to l.start + MAX_LOCK_MS (950 + 12_000 = 12_950).
+        for ms in (4500..=12_500).step_by(500) {
+            t.keep_alive(ms, |n| n == 0x1234);
+        }
+        assert!(t.active(0x1234, 12_949).is_some());
+        assert!(t.active(0x1234, 12_950).is_none());
+        let gone = t.expire(12_950);
+        assert_eq!(gone.len(), 1);
+    }
+
+    #[test]
+    fn client_yieldable_boss_rules() {
+        // Untouched 2-life open-world miniboss (e.g. 2nd General 1100301): yieldable.
+        assert!(super::is_client_yieldable_boss(false, Some(1300), false, 2, 2, 1000, 1000, 500, 500));
+        // Great Serpent (c5010): yieldable.
+        assert!(super::is_client_yieldable_boss(false, Some(5010), false, 1, 1, 9999, 9999, 0, 0));
+        // Main table boss (Owl, Genichiro, Isshin): never yielded.
+        assert!(!super::is_client_yieldable_boss(true, Some(1000), true, 2, 2, 5000, 5000, 2000, 2000));
+        // Damaged / engaged miniboss or active boss gauge: never yielded.
+        assert!(!super::is_client_yieldable_boss(false, Some(1300), false, 2, 2, 950, 1000, 500, 500));
+        assert!(!super::is_client_yieldable_boss(false, Some(1300), true, 2, 2, 1000, 1000, 500, 500));
     }
 }
 

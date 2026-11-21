@@ -1,0 +1,115 @@
+COOP SEKIRO - DIRECT UDP CO-OP GUIDE
+====================================
+Use Direct UDP whenever one or more players aren't using Steam networking
+(offline play, local LAN, virtual LAN, or whenever Steam lobbies aren't
+available).
+
+Note: Everyone in the session must use Direct UDP to connect to each other,
+even if some players are running through Steam. (If everyone plays online
+through Steam, leave `transport = auto` for one-click Steam Invites instead.)
+
+BEFORE YOU START
+----------------
+1. Everyone needs Sekiro v1.06 (unmodified sekiro.exe) and the exact same
+   CooP Sekiro version.
+2. Remove any old online mods (dinput8.dll, steam_api64.org, cream_api.ini,
+   SekiroOnlineFont.ttf) from the game folder if you had them installed.
+3. Extract `coop_sekiro_launcher.exe` and the `CoopSekiro` folder directly
+   into your Sekiro folder (next to `sekiro.exe`).
+4. Always launch co-op with `coop_sekiro_launcher.exe`.
+   (Your co-op save is stored separately as S0000.co2 and never touches your
+   vanilla save, though backing up your saves first is always recommended.)
+5. Unlock the co-op items: after the intro (wake up at Dilapidated Temple),
+   rest at the Dilapidated Temple idol to receive:
+     - Kindred Bell   = Host (open your world)
+     - Kindred Charm  = Join (connect to the host)
+     - Severed Thread = Leave co-op
+
+STEP 1: SETTINGS FOR EVERYONE (HOST AND JOINERS)
+------------------------------------------------
+Open `CoopSekiro\sekiro_coop_settings.ini` in Notepad and set:
+
+  password = yourpassword
+  player_name = YourName
+
+Scroll down to [ADVANCED] and set:
+
+  transport = udp
+
+Save the file.
+- `password` cannot be blank and must be identical on every PC.
+- `player_name` is optional, but recommended so players don't all show up as
+  "Wolf".
+- You do NOT need to change `steam_invites`.
+- Tip: You can also switch `Connection mode` to `Direct UDP` in-game under
+  Options > CooP Sekiro Settings, and the mod automatically re-reads the .ini
+  file every ~2 seconds without needing a restart.
+
+STEP 2: HOSTING (ONLY ONE PLAYER DOES THIS)
+-------------------------------------------
+Only the host needs to be reachable. Pick whichever method fits best:
+
+OPTION A - Virtual LAN (Easiest over the internet - no router setup)
+  1. Everyone installs a free virtual LAN app (Radmin VPN, ZeroTier, or
+     Tailscale) and joins the same private network.
+  2. The host copies their virtual LAN IP (e.g. 26.x.x.x in Radmin VPN or
+     100.x.x.x in Tailscale) and sends it to everyone joining.
+  3. Host launches `coop_sekiro_launcher.exe`, loads their save, and uses
+     the Kindred Bell.
+
+OPTION B - Automatic UPnP (No extra apps needed, works on most home routers)
+  1. Host launches `coop_sekiro_launcher.exe`, loads their save, and uses
+     the Kindred Bell. (The join code only appears AFTER ringing the Bell.)
+  2. Check the top-left overlay (or `CoopSekiro\udp_join_code.txt`):
+     - If it shows `UDP host, join code 1.2.3.4:28100`, send that exact
+       address to everyone joining.
+     - If it says `UPnP failed` or `WARNING: no public IP`, use Option A
+       (Virtual LAN) or Option C instead.
+
+OPTION C - Local LAN or Manual Port Forwarding
+  - Same home network (LAN): After ringing the Kindred Bell, share the
+    `LAN 192.168.x.x:28100` address shown in the host's top-left overlay.
+  - Manual port forward (Internet): Forward UDP port 28100 to the host PC
+    in your router settings, look up your public IP (e.g. whatismyip.com),
+    and share `<public-ip>:28100`.
+
+* Firewall note: If Windows Defender Firewall asks for permission when the
+  host launches `sekiro.exe`, click Allow (inbound UDP 28100).
+
+STEP 3: JOINING (EVERYONE EXCEPT THE HOST)
+------------------------------------------
+1. Open `CoopSekiro\sekiro_coop_settings.ini`, scroll to [ADVANCED], and
+   paste the host's IP/join code:
+
+     udp_host_address = 26.12.34.56:28100
+
+   (Putting just the IP like `26.12.34.56` also works if using default port
+   28100.)
+2. Save the file.
+3. Launch `coop_sekiro_launcher.exe`, load your save, and use the
+   Kindred Charm.
+4. Wait a few seconds -- the top-left overlay will switch from
+   `searching for host at ... (UDP)...` to `connected to <Host> (UDP)`.
+
+LEAVING CO-OP
+-------------
+1. Everyone uses the Severed Thread (joiners first, host last).
+2. Exit normally with Quit Game or Alt+F4. (Quit Game is intentionally greyed
+   out while connected.)
+
+QUICK TROUBLESHOOTING
+---------------------
+- "Set a password in sekiro_coop_settings.ini first" / password refused:
+  Make sure `password = ...` is filled in and matches exactly on all PCs.
+- Stuck on "searching for host at ... (UDP)...":
+  1. Make sure the host has already rung the Kindred Bell in-game.
+  2. Confirm EVERYONE (including Steam players) has `transport = udp`.
+  3. Check Windows Firewall on the host PC isn't blocking `sekiro.exe`
+     (UDP port 28100).
+  4. If UPnP failed or showed `WARNING: no public IP`, switch to a Virtual
+     LAN (Option A) or let another player host.
+  5. Double-check `udp_host_address` for typos and make sure `udp_port`
+     matches on everyone (default: 28100).
+- Version or NG cycle error:
+  Everyone must run the same CooP Sekiro version and be on the same NG cycle
+  (or set `allow_cross_cycle = 1` on all PCs).

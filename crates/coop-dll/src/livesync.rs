@@ -83,8 +83,8 @@ const MAX_LOGS: u32 = 40;
 /// within `REST_BASELINE_FOR` of the start) are a baseline, not deathblows (§34).
 const REST_GUARD: Duration = Duration::from_secs(30);
 const REST_BASELINE_FOR: Duration = Duration::from_millis(3500);
-/// The others' lives states are ignored this long after a death reload of ours (v8.6).
-const DEATH_GUARD: Duration = Duration::from_secs(45);
+/// The others' lives states are ignored this long after a death reload of ours.
+const DEATH_GUARD: Duration = Duration::from_secs(15);
 /// Our own deathblow took a life: the copy gets this long to get up by itself, and the
 /// watch ends after `OWN_DROP_FOR`.
 const OWN_GETUP_AFTER: Duration = Duration::from_millis(1500);
@@ -279,10 +279,12 @@ pub fn lives_write_ok(cur: i32, to: i32) -> bool {
     to <= cur.max(0)
 }
 
-/// The boss gauge's entity or a final entity of a `bosses.rs` encounter: tracked for death
-/// even with a single life (`lives0 == 1`, e.g. Way of Tomoe 1110801).
+/// Any entity of a `bosses.rs` encounter or holding the boss gauge: tracked for death and
+/// HP/throw sync even when an intermediate phase has a single life (`lives0 == 1`, e.g.
+/// Lady Butterfly P1 1000800, Emma 1110900, Way of Tomoe 1110801, Sword Saint's Genichiro
+/// 1120830, Folding Screen Monkeys 2000801..2000804).
 pub fn boss_tracked(entity: Option<i32>, gauge: Option<i32>) -> bool {
-    entity.is_some_and(|e| e > 0 && (gauge == Some(e) || crate::bosses::encounter_of(e).is_some_and(|enc| enc.final_entities.contains(&e))))
+    entity.is_some_and(|e| e > 0 && (gauge == Some(e) || crate::bosses::encounter_of(e).is_some()))
 }
 
 /// The one writer of `data+0x25C` (also persist.rs): refuses and logs a raise.
@@ -408,7 +410,7 @@ pub(crate) fn read_data(chr: Chr) -> Option<(usize, i32, i32, i32, i32)> {
 }
 
 /// Current posture (`data+0x148`); read_data's tuple is shared with other modules.
-fn read_posture(data: usize) -> Option<i32> {
+pub(crate) fn read_posture(data: usize) -> Option<i32> {
     read::<i32>(data + DATA_POSTURE)
 }
 
@@ -457,9 +459,9 @@ pub fn tick(enemies: &Enemies, _peers: &PeerSet) {
         st.death_guard_logged = true;
         log::line("livesync: right after our death reload: the others' lives states are ignored for a while (they may still be in the old world)");
     }
-    // A wipe within WIPE_STALE: the friend's states are from before the reset (v8.25c). On the
+    // A wipe still settling: the friend's states are from before the reset. On the
     // rising edge everything kept from before is dropped too.
-    let wiped = crate::persist::wipe_recent(crate::persist::WIPE_STALE);
+    let wiped = crate::persist::wipe_active();
     if wiped && !st.wipe_seen {
         st.remote.clear();
         st.baseline.clear();
@@ -978,9 +980,15 @@ mod own_getup_tests {
 
     #[test]
     fn a_single_life_boss_death_is_applied_and_held_for_a_throw() {
-        // Way of Tomoe 1110801: lives0 1, lives read 0 while alive.
+        // Way of Tomoe 1110801 and intermediate / puzzle bosses (Lady Butterfly P1, Emma,
+        // Sword Saint Genichiro, Folding Screen Monkeys) all track even with lives0 == 1.
         assert!(boss_tracked(Some(1110801), None));
+        assert!(boss_tracked(Some(1000800), None));
+        assert!(boss_tracked(Some(1110900), None));
+        assert!(boss_tracked(Some(1120830), None));
+        assert!(boss_tracked(Some(2000801), None));
         assert!(boss_tracked(Some(5), Some(5)));
+        assert!(!boss_tracked(Some(1100100), None));
         assert!(!boss_tracked(Some(5), Some(6)) && !boss_tracked(None, None));
         assert_eq!(plan(0, false, 0, LIFE_DEAD | LIFE_FRESH, false, true), Plan::Kill { loot: true });
         assert_eq!(plan(0, false, 0, LIFE_DEAD | LIFE_FRESH, true, true), Plan::Hold);

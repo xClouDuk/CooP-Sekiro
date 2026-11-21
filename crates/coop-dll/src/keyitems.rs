@@ -790,6 +790,12 @@ fn grant_now(entries: &[[u32; 4]]) -> bool {
     true
 }
 
+/// Grants explicit item entries (used by `itemdrop.rs` when picking up dropped consumables
+/// or upgrade materials; outside `AwardItemLot`, so key-item sharing ignores it).
+pub(crate) fn grant_entries(entries: &[[u32; 4]]) -> bool {
+    grant_now(entries)
+}
+
 /// Per-player flags (item lots): set here only, world.rs never sends them.
 fn set_flag_on(id: u32) -> bool {
     let Some(fm) = world::real_world_flag_man() else { return false };
@@ -1150,7 +1156,12 @@ fn build_lot_index() -> Option<LotIndex> {
         }
     }
     let shop_flags: HashSet<u32> = file(SHOP_LINEUP_PARAM::NAME)
-        .map(|s| unsafe { s.rows::<SHOP_LINEUP_PARAM>() }.map(|(_, r)| r.event_flag()).filter(|&f| f > 0).map(|f| f as u32).collect())
+        .map(|s| {
+            let rows: Vec<(i32, i16)> = unsafe { s.rows::<SHOP_LINEUP_PARAM>() }
+                .map(|(_, r)| (r.event_flag(), r.sell_quantity()))
+                .collect();
+            crate::world::expand_shop_stock_flags(&rows).into_iter().collect()
+        })
         .unwrap_or_default();
     let mut rows = HashMap::new();
     let (mut script, mut drops, mut treasure, mut shop, mut repeat, mut not_sure, mut coop) = (0, 0, 0, 0, 0, 0, 0);
@@ -1256,6 +1267,12 @@ pub struct KeyItems {
 }
 
 impl KeyItems {
+    /// Loading screen / area reload: ground drops at a corpse do not survive across loads,
+    /// so clear `own_drops` to ensure any uncollected miniboss drop (`BULK_BOSS_DROP`) still awards.
+    pub fn on_loading(&mut self) {
+        self.own_drops.clear();
+    }
+
     /// bossrules.rs, once per frame in the world. Grants and boss drops go to everyone;
     /// the key-item check and the reward reconcile run host <-> each client.
     pub fn on_frame(&mut self, net: &mut Option<&mut Net>, peers: &PeerSet, connected: bool, in_world_for: Duration) {
@@ -1807,7 +1824,10 @@ impl KeyItems {
             if d.deathblows < 2 {
                 continue;
             }
-            self.own_drops.insert(d.entity, (now, d.item_drop));
+            let player_alive = game::player().and_then(|p| p.hp()).is_some_and(|h| h > 0);
+            if d.item_drop && player_alive {
+                self.own_drops.insert(d.entity, (now, true));
+            }
             if d.item_drop
                 && d.lot > 0
                 && let Some(n) = net.as_deref_mut().filter(|_| connected)
@@ -2239,5 +2259,14 @@ mod tests {
         assert!(!unique(GOODS | 4000, Some(BEADS)));
         assert!(unique(700_000, None));
         assert!(!unique(GOODS | 1, None));
+    }
+
+    #[test]
+    fn loading_clears_own_drops_so_boss_drop_awards_after_spectator_reload() {
+        let mut k = KeyItems::default();
+        k.own_drops.insert(1100301, (Instant::now(), true));
+        assert!(k.own_drops.contains_key(&1100301));
+        k.on_loading();
+        assert!(!k.own_drops.contains_key(&1100301));
     }
 }

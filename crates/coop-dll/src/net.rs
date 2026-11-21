@@ -48,7 +48,7 @@ pub use crate::peers::PeerId;
 use crate::peers::MAX_PLAYERS;
 use crate::game::Chr;
 use crate::settings::{self, NetSettings, TransportSetting};
-use crate::steam::{self, Lobby, Out, Want};
+use crate::steam::{self, Lobby, LobbyMode, Out, Want};
 use crate::log;
 
 const LOOPBACK_DELAY: Duration = Duration::from_secs(1);
@@ -128,10 +128,38 @@ const INTENT_HOST: u8 = 2;
 const INTENT_JOIN: u8 = 3;
 /// No item used since the game started: `auto_connect` decides.
 static INTENT: AtomicU8 = AtomicU8::new(INTENT_UNSET);
+/// Steam lobby ID accepted via Steam overlay invite (`GameLobbyJoinRequested_t`) or `+connect_lobby`.
+static INVITE_LOBBY: AtomicU64 = AtomicU64::new(0);
+/// Set when ringing Kindred Bell while already hosting in invite mode to pop Steam's invite UI.
+static OPEN_INVITE_OVERLAY: AtomicBool = AtomicBool::new(false);
+
+pub fn pending_invite_lobby() -> Option<u64> {
+    let id = INVITE_LOBBY.load(Ordering::Acquire);
+    (id != 0).then_some(id)
+}
+
+pub fn request_invite_overlay() {
+    OPEN_INVITE_OVERLAY.store(true, Ordering::Relaxed);
+}
+
+/// Records an accepted Steam overlay invite and restarts the session to join that lobby.
+pub fn accept_steam_invite(lobby_id: u64) {
+    if lobby_id == 0 {
+        return;
+    }
+    INVITE_LOBBY.store(lobby_id, Ordering::Release);
+    INTENT.store(INTENT_JOIN, Ordering::Release);
+    SESSION_GEN.fetch_add(1, Ordering::AcqRel);
+    log::line(&format!("net: accepted Steam invite to lobby ..{:04}, starting join", lobby_id % 10000));
+    settings::request_reconnect();
+}
 
 /// Sets the intent and reconnects: the frame task drops the current `Net` (a clean
 /// quit, the Steam lobby is left) and builds the next one with `Net::from_config`.
 pub fn set_intent(intent: Intent) {
+    if matches!(intent, Intent::Solo | Intent::Host) {
+        INVITE_LOBBY.store(0, Ordering::Release);
+    }
     let v = match intent {
         Intent::Solo => INTENT_SOLO,
         Intent::Host => INTENT_HOST,
@@ -167,7 +195,7 @@ pub fn on_title() {
     crate::optmenu::on_title();
     SESSION_GEN.fetch_add(1, Ordering::AcqRel);
     let was = INTENT.load(Ordering::Acquire);
-    if was == INTENT_HOST || was == INTENT_JOIN {
+    if INVITE_LOBBY.load(Ordering::Acquire) == 0 && (was == INTENT_HOST || was == INTENT_JOIN) {
         INTENT.store(INTENT_SOLO, Ordering::Release);
     }
     TITLE_HOLD.store(true, Ordering::Release);
@@ -817,6 +845,28 @@ pub struct Net {
     refusals_said: Vec<((RejectReason, String), Instant)>,
     /// Host: when the relay totals were last logged, and the totals then.
     relay_log: (Instant, (u64, u64)),
+    /// Guard so `quit()` sends Bye once even when called explicitly before `drop()`.
+    quit_sent: bool,
+}
+
+/// True when this session should open Direct UDP immediately without touching Steam.
+fn should_open_udp_directly(cfg: &NetSettings, want: Want, invite_lobby: Option<u64>) -> bool {
+    if invite_lobby.is_some() {
+        return false;
+    }
+    if cfg.transport == TransportSetting::Udp {
+        return true;
+    }
+    cfg.transport == TransportSetting::Auto
+        && cfg.steam_invites
+        && want == Want::Join
+        && !cfg.udp_host_address.trim().is_empty()
+}
+
+/// True when `transport = auto` may fall back from Steam to Direct UDP.
+/// Never opens unauthenticated UDP if no password is set.
+fn can_fallback_to_udp(cfg: &NetSettings, invite_lobby: Option<u64>) -> bool {
+    invite_lobby.is_none() && cfg.transport == TransportSetting::Auto && !cfg.password.is_empty()
 }
 
 #[derive(Default)]
@@ -824,13 +874,14 @@ pub enum UpnpState {
     #[default]
     Working,
     Mapped(Mapping),
-    Failed(String),
+    Failed(String, Option<Ipv4Addr>),
 }
 
 impl Net {
     /// Returns `None` when networking is off or misconfigured (logged, and `offline_status` says why).
     pub fn from_config() -> Option<Self> {
         let cfg = settings::net();
+        let invite_lobby = pending_invite_lobby();
         publish_link(Link::Off);
         // The items decide; with no item used yet `auto_connect = 1` gives the old auto role.
         let want = match INTENT.load(Ordering::Acquire) {
@@ -839,7 +890,9 @@ impl Net {
             INTENT_UNSET if cfg.auto_connect => Some(Want::Auto),
             _ => None,
         };
-        if cfg.password.is_empty() && (want.is_some() || cfg.loopback) {
+        let direct_udp = want.is_some_and(|w| should_open_udp_directly(&cfg, w, invite_lobby));
+        let invite_only = !direct_udp && cfg.uses_steam_invites(invite_lobby.is_some());
+        if cfg.password.is_empty() && ((!invite_only && want.is_some()) || cfg.loopback) {
             set_offline("password not set - edit sekiro_coop_settings.ini");
             return None;
         }
@@ -860,7 +913,7 @@ impl Net {
         if !echoes.is_empty() {
             log::line(&format!("net: {} loopback peer(s) will join while we host (loopback_peers)", echoes.len()));
         }
-        if cfg.transport == TransportSetting::Udp {
+        if direct_udp {
             // The Steam name is only looked up when no name is set.
             let steam_api = if cfg.player_name.trim().is_empty() { steam::Api::load().ok() } else { None };
             let name = display_name(&cfg, steam_api.as_deref());
@@ -928,6 +981,7 @@ impl Net {
             netai_inbox: Vec::new(),
             bulk_inbox: Vec::new(),
             netai_bytes: 0,
+            quit_sent: false,
         }
     }
 
@@ -972,19 +1026,27 @@ impl Net {
     fn steam_tick(&mut self, now: Instant) {
         let Some(mut link) = self.steam.take() else { return };
         let connected = self.connected();
+        let invite_lobby = pending_invite_lobby();
+        let invite_mode = self.cfg.uses_steam_invites(invite_lobby.is_some());
         // The Steam interfaces appear once the game has logged in; keep looking.
         if link.lobby.is_none() && now >= link.next_load {
             match steam::Api::load() {
                 Ok(api) => {
                     let name = display_name(&self.cfg, Some(&api));
-                    let sock = wrap(Box::new(steam::SteamTransport::new(api.clone())), self.hub.as_ref());
+                    let transport = Arc::new(steam::SteamTransport::new(api.clone()));
+                    let sock = wrap(Box::new(steam::SharedSteamTransport(transport.clone())), self.hub.as_ref());
                     self.session = Session::with_transport(sock, Role::Host, &self.cfg.password, &name);
                     self.session.set_uid(api.me);
                     let want = self.want;
-                    log::line(&format!("net: Steam ready, name {name:?}, lobby role {want:?}"));
+                    let mode = if invite_mode {
+                        LobbyMode::InviteOnly { target: invite_lobby }
+                    } else {
+                        LobbyMode::Password
+                    };
+                    log::line(&format!("net: Steam ready, name {name:?}, lobby role {want:?}, mode {mode:?}"));
                     self.own_name = name;
                     let size = crate::tuning::max_players() as i32;
-                    link.lobby = Some(Lobby::new(api, &self.cfg.password, want, size));
+                    link.lobby = Some(Lobby::new(api, transport, &self.cfg.password, want, mode, size));
                     link.error = None;
                 }
                 Err(e) => {
@@ -999,6 +1061,9 @@ impl Net {
         if let Some(lobby) = link.lobby.as_mut() {
             // max_players is live: a lobby we host follows it (Steam fixes the size at creation).
             lobby.set_max_members(crate::tuning::max_players() as i32);
+            if OPEN_INVITE_OVERLAY.swap(false, Ordering::Relaxed) {
+                let _ = lobby.open_invite_overlay();
+            }
             // The Steam users we have a live link to (uid = SteamID64 from the address).
             let linked: Vec<u64> = self.session.peers().into_iter().map(|(_, uid, _)| uid).filter(|&u| u != 0).collect();
             let out = lobby.tick(connected, &linked);
@@ -1009,34 +1074,60 @@ impl Net {
                 self.notify_reject(RejectReason::Version, now);
             }
             match out {
-                Some(Out::Hosting) => {
+                Some(Out::Hosting { secret }) => {
                     self.role = RoleState::Host;
+                    self.session.set_password(&secret);
+                    for e in &mut self.echoes {
+                        e.session.set_password(&secret);
+                    }
                     self.session.set_role(Role::Host);
                     log::line("net: hosting through a Steam lobby");
                 }
-                Some(Out::JoinedHost(id)) => {
+                Some(Out::JoinedHost { host, secret }) => {
                     self.role = RoleState::Client;
-                    self.session.set_role(Role::Client { host: steam_addr(id) });
+                    self.session.set_password(&secret);
+                    self.session.set_role(Role::Client { host: steam_addr(host) });
                     log::line("net: joined a Steam lobby, connecting to its host");
                 }
+                Some(Out::InviteFailed(why)) => {
+                    INVITE_LOBBY.store(0, Ordering::Release);
+                    log::line(&format!("net: Steam invite failed: {why}"));
+                    crate::dialog::game_notice(why, crate::dialog::Importance::Membership, 8);
+                    set_intent(Intent::Solo);
+                }
                 Some(Out::HostLeft) => {
+                    log::line("net: left the Steam lobby, ending session");
+                    // Joined with the item (or Steam invite) and the host's lobby is gone: its world is closed.
+                    self.host_closed();
                     self.role = RoleState::Pending;
                     self.session.set_role(Role::Host);
-                    log::line("net: left the Steam lobby, searching again");
-                    // Joined with the item and the host's lobby is gone: its world is closed.
-                    self.host_closed();
+                    if invite_mode && self.want == Want::Join && INTENT.load(Ordering::Acquire) == INTENT_JOIN {
+                        INVITE_LOBBY.store(0, Ordering::Release);
+                        set_intent(Intent::Solo);
+                    }
                 }
                 None => {}
             }
         }
         let settled = link.lobby.as_ref().is_some_and(|l| l.ready());
-        if self.cfg.transport == TransportSetting::Auto && !settled && now.duration_since(link.since) >= STEAM_FALLBACK_AFTER {
-            let why = link.lobby.as_ref().map(|l| l.status()).or(link.error.clone()).unwrap_or_default();
-            if self.fall_back_to_udp(&why) {
-                return; // `link` (and its lobby search) is dropped here
+        let hard_failed = link.lobby.as_ref().is_some_and(|l| l.hard_failed());
+        let timed_out = now.duration_since(link.since) >= STEAM_FALLBACK_AFTER;
+        if !settled && self.cfg.transport == TransportSetting::Auto && invite_lobby.is_none() && (hard_failed || timed_out) {
+            if can_fallback_to_udp(&self.cfg, invite_lobby) {
+                let why = link.lobby.as_ref().map(|l| l.status()).or(link.error.clone()).unwrap_or_default();
+                if self.fall_back_to_udp(&why) {
+                    return; // `link` (and its lobby search) is dropped here
+                }
+                // Joining by role without an address: UDP is no way out, Steam keeps trying.
+                link.since = now + Duration::from_secs(3600);
+            } else if hard_failed || (link.lobby.is_none() && timed_out) {
+                if self.error.is_none() {
+                    self.error = Some(
+                        "Steam unavailable - switch Connection mode to Direct UDP and set a password in sekiro_coop_settings.ini"
+                            .into(),
+                    );
+                }
             }
-            // Joining by role without an address: UDP is no way out, Steam keeps trying.
-            link.since = now + Duration::from_secs(3600);
         }
         self.steam = Some(link);
     }
@@ -1071,9 +1162,13 @@ impl Net {
     /// lobby is gone): co-op ends for us too, we stay in our own world. Only after we
     /// were connected once; a lobby that never answered is searched again instead.
     fn host_closed(&mut self) {
-        if self.want != Want::Join || !self.connected_once || INTENT.load(Ordering::Acquire) != INTENT_JOIN {
+        if !self.connected_once || (self.want != Want::Join && self.role != RoleState::Client) {
             return;
         }
+        if INTENT.load(Ordering::Acquire) == INTENT_SOLO {
+            return;
+        }
+        INVITE_LOBBY.store(0, Ordering::Release);
         let host = self.peer_name().map(str::to_owned).unwrap_or_else(|| "The host".into());
         log::line(&format!("net: {host} closed their world, ending co-op"));
         crate::dialog::game_notice(format!("{host} closed their world. Co-op has ended."), crate::dialog::Importance::Membership, 8);
@@ -1111,8 +1206,9 @@ impl Net {
         for p in self.peers().filter(|p| p.wants_raw_at(now)) {
             mask |= 1 << p.id.slot();
         }
-        let forward = mask != 0;
-        crate::native::set_forward(mask);
+        let anchored = crate::bossrules::spectate_streaming_anchored();
+        let forward = mask != 0 && !anchored;
+        crate::native::set_forward(if anchored { 0 } else { mask });
         for (ptype, data) in crate::native::take_outbound() {
             if forward {
                 self.send_raw_masked(mask, ptype, &data, now);
@@ -1144,19 +1240,23 @@ impl Net {
             {
                 log::line(&format!("party: our max HP reads {m}"));
             }
+            let frozen = crate::bossrules::spectate_frozen_death_pos();
             let mut snap = match player
                 .and_then(|p| Some((p.position()?, p.angle()?, p.hp()?)))
                 .filter(|&(pos, angle, _)| crate::game::sane_pos(pos) && crate::game::sane_angle(angle))
             {
-                Some((pos, angle, hp)) => Snapshot {
-                    pos,
-                    angle,
-                    hp,
-                    max_hp: player.and_then(|p| p.max_hp()).unwrap_or(0),
-                    anim,
-                    block: crate::game::current_block().unwrap_or(-1),
-                    ..Default::default()
-                },
+                Some((pos, angle, hp)) => {
+                    let (pos, angle) = frozen.unwrap_or((pos, angle));
+                    Snapshot {
+                        pos,
+                        angle,
+                        hp,
+                        max_hp: player.and_then(|p| p.max_hp()).unwrap_or(0),
+                        anim,
+                        block: crate::game::current_block().unwrap_or(-1),
+                        ..Default::default()
+                    }
+                }
                 None => Snapshot { hidden: true, ..Default::default() },
             };
             if let Some(p) = player
@@ -1528,6 +1628,13 @@ impl Net {
                     .into();
             }
             return match (&link.lobby, &link.error) {
+                (Some(lobby), _)
+                    if lobby.ready()
+                        && self.role == RoleState::Host
+                        && self.cfg.uses_steam_invites(pending_invite_lobby().is_some()) =>
+                {
+                    "hosting (Steam) - use Kindred Bell again to invite friends".into()
+                }
                 (Some(lobby), _) if lobby.ready() && self.role == RoleState::Host => {
                     "hosting - waiting for a companion (Steam)".into()
                 }
@@ -1550,6 +1657,10 @@ impl Net {
     /// Clean shutdown before settings are re-applied or an item ends the session. The
     /// Bye is unreliable: sent three times so a UDP friend hears it ("left" at once).
     pub fn quit(&mut self) {
+        if self.quit_sent {
+            return;
+        }
+        self.quit_sent = true;
         let now = Instant::now();
         for _ in 0..3 {
             self.session.quit(now);
@@ -1589,8 +1700,12 @@ fn start_upnp(port: u16) -> Arc<Mutex<UpnpState>> {
                 UpnpState::Mapped(m)
             }
             Err(e) => {
-                log::line(&format!("upnp: failed: {e}"));
-                UpnpState::Failed(e)
+                let local_ip = upnp::primary_local_ip();
+                match local_ip {
+                    Some(ip) => log::line(&format!("upnp: failed: {e} (local LAN address: {ip}:{port})")),
+                    None => log::line(&format!("upnp: failed: {e}")),
+                }
+                UpnpState::Failed(e, local_ip)
             }
         };
         if let Ok(mut s) = out.lock() {
@@ -1611,13 +1726,20 @@ impl Net {
                 m.join_code()
             ),
             UpnpState::Mapped(m) => format!("UDP host, join code {} (saved to udp_join_code.txt)", m.join_code()),
-            UpnpState::Failed(e) => format!("UDP host on port {}, UPnP failed: {e}", self.cfg.udp_port),
+            UpnpState::Failed(e, Some(ip)) => format!("UDP host on port {} (LAN {ip}:{}), UPnP failed: {e}", self.cfg.udp_port, self.cfg.udp_port),
+            UpnpState::Failed(e, None) => format!("UDP host on port {}, UPnP failed: {e}", self.cfg.udp_port),
         })
     }
 }
 
 impl Drop for Net {
     fn drop(&mut self) {
+        self.quit();
+        if let Some(link) = &mut self.steam
+            && let Some(lobby) = &mut link.lobby
+        {
+            lobby.leave();
+        }
         // No session any more: stop teeing our player's packets.
         crate::native::set_forward(0);
         publish_link(Link::Off);
@@ -1646,6 +1768,12 @@ impl Net {
 impl Net {
     pub fn is_host(&self) -> bool {
         self.role == RoleState::Host
+    }
+
+    /// True while this player has opened a host world (Kindred Bell active), even with
+    /// zero companions connected yet or while the Steam lobby is still being created.
+    pub fn is_hosting_open(&self) -> bool {
+        self.role == RoleState::Host || self.want == Want::Host
     }
 
     /// Hosting over UDP: the friend can fetch the test build over HTTP from here.
@@ -1929,5 +2057,31 @@ mod tests {
         p.on_snapshot(t0, Snapshot { want_raw: true, ..snap(1, false) });
         assert!(p.wants_raw_at(t0 + Duration::from_secs(1)));
         assert!(!p.wants_raw_at(t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn direct_udp_and_fallback_respect_transport_password_and_invites() {
+        let base = NetSettings::default();
+        // Default Auto + Steam Invites: Steam first for host, direct UDP only when Join has udp_host_address.
+        assert!(!should_open_udp_directly(&base, Want::Host, None));
+        assert!(!should_open_udp_directly(&base, Want::Join, None));
+        let join_addr = NetSettings { udp_host_address: "192.168.1.10:28100".into(), ..base.clone() };
+        assert!(should_open_udp_directly(&join_addr, Want::Join, None));
+        assert!(!should_open_udp_directly(&join_addr, Want::Host, None));
+        assert!(!should_open_udp_directly(&join_addr, Want::Join, Some(12345)));
+
+        // Explicit transport = udp opens Direct UDP immediately even when steam_invites = 1.
+        let udp = NetSettings { transport: TransportSetting::Udp, ..base.clone() };
+        assert!(should_open_udp_directly(&udp, Want::Host, None));
+        assert!(should_open_udp_directly(&udp, Want::Join, None));
+        assert!(!should_open_udp_directly(&udp, Want::Join, Some(12345)));
+
+        // Auto fallback to UDP requires a non-empty password and no active Steam invite.
+        assert!(!can_fallback_to_udp(&base, None));
+        let with_pw = NetSettings { password: "secret".into(), ..base };
+        assert!(can_fallback_to_udp(&with_pw, None));
+        assert!(!can_fallback_to_udp(&with_pw, Some(12345)));
+        let steam_only = NetSettings { transport: TransportSetting::Steam, ..with_pw };
+        assert!(!can_fallback_to_udp(&steam_only, None));
     }
 }

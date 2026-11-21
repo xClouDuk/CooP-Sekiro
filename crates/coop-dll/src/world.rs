@@ -31,7 +31,7 @@
 //! which is separate from the normal save, so the solo game is untouched.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use coop_net::{FLAG_DUMP_DISABLED, FLAG_DUMP_OK, FLAG_DUMP_UNAVAILABLE, decode_flag_dump, encode_flag_dump};
@@ -60,6 +60,9 @@ pub const EV_DOWN: u8 = 7;
 pub const EV_HOST_IDOL: u8 = 41;
 /// ObjAct interaction replay: `a` = block slot, `b` = ObjAct info index (`doors.rs`).
 pub const EV_OBJACT: u8 = 45;
+/// Full party wipe (`a = 0`) or boss-fight wipe (`a = boss entity`): clear persisted boss HP
+/// and guard against pre-wipe state until everyone finishes reloading.
+pub const EV_WIPE: u8 = 46;
 /// Bulk from the killer of a boss: the item lots the fight gave it (bossrules.rs).
 pub const BULK_BOSS_REWARD: u8 = 6;
 /// Bulk transfer kind of the host's flag dump.
@@ -137,9 +140,17 @@ fn base() -> usize {
 pub(crate) const PER_PLAYER_STATE: [u32; 14] =
     [9100, 9110, 21_114_178, 21_114_179, 21_115_312, 21_115_313, 11_125_671, 627, 70, 71, 72, 73, 74, 75];
 
+/// Dilapidated Temple Sculptor prosthetic-fit/upgrade handshake and menu state flags.
+/// Keeping these per-player prevents fitting or upgrading a Prosthetic Tool from forcing
+/// another player onto one knee at the Sculptor (`SpEffect 30510`).
+pub(crate) const SCULPTOR_PROSTHETIC_HANDSHAKE: std::ops::RangeInclusive<u32> = 71_100_125..=71_100_128;
+pub(crate) const SCULPTOR_PROSTHETIC_TOOLS: std::ops::RangeInclusive<u32> = 71_101_600..=71_101_619;
+
 /// A flag that is per player state (never shared; see `PER_PLAYER_STATE`).
 pub(crate) fn per_player_state(id: u32) -> bool {
     PER_PLAYER_STATE.contains(&id)
+        || SCULPTOR_PROSTHETIC_HANDSHAKE.contains(&id)
+        || SCULPTOR_PROSTHETIC_TOOLS.contains(&id)
 }
 
 /// Story phase flags (group 0, k = 8 or 6, which `shared_ks(0)` never dumps): 8301 Interior
@@ -250,7 +261,7 @@ pub fn should_sync(id: u32) -> bool {
     // 2026-10-24: ids 20..=30 are the ending / New Game+ requests (InGameStep 0x140A71190:
     // 20-23 start the ending, 30 requests the next lap). Never shared: the companion must
     // not get the ending or NG+ (ngblock.rs).
-    if id == 0 || (9500..=9599).contains(&id) || (20..=30).contains(&id) || PER_PLAYER_STATE.contains(&id) || is_item_flag(id) {
+    if id == 0 || (9500..=9599).contains(&id) || (20..=30).contains(&id) || per_player_state(id) || is_item_flag(id) {
         return false;
     }
     // Story phase (group 0, k = 8): shared, host authoritative.
@@ -261,7 +272,8 @@ pub fn should_sync(id: u32) -> bool {
     let k = id / 1000 % 10;
     match top {
         0 => matches!(k, 0 | 1 | 5 | 9),
-        1 | 2 => matches!(k, 0 | 1 | 4 | 5 | 6 | 7),
+        1 => matches!(k, 0 | 1 | 4 | 5 | 6 | 7),
+        2 => matches!(k, 0 | 1 | 4 | 6 | 7),
         6 => k == 0,
         7 => true,
         _ => false,
@@ -274,11 +286,21 @@ pub fn should_sync(id: u32) -> bool {
 fn shared_ks(group: u32) -> &'static [u32] {
     match group {
         0 => &[0, 1, 5, 9],
-        1 | 2 => &[0, 1, 4, 5, 6, 7],
+        1 => &[0, 1, 4, 5, 6, 7],
+        2 => &[0, 1, 4, 6, 7],
         6 => &[0],
         7 => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         _ => &[],
     }
+}
+
+/// True when the 1000-flag record at `base_id` (`base_id % 1000 == 0`) belongs to a
+/// `(group, k)` class that `should_sync` shares, regardless of whether an individual
+/// flag like `base_id + 1` is a per-player item or shop flag.
+fn is_shared_record_base(base_id: u32) -> bool {
+    let top = base_id / 10_000_000 % 10;
+    let k = base_id / 1000 % 10;
+    shared_ks(top).contains(&k)
 }
 
 /// One shared flag record of the active bank.
@@ -349,7 +371,7 @@ fn shared_records(fm: usize) -> Vec<FlagRecord> {
                 for &k in ks {
                     let id = id0 + k * 1000;
                     if let Some(r) = record_at(fm, g, entry + RECORD * k as usize, id)
-                        && should_sync(id + 1)
+                        && is_shared_record_base(id)
                     {
                         out.push(r);
                     }
@@ -537,6 +559,7 @@ pub struct World {
     prev_in_world: Duration,
     diff_due: Option<(Instant, &'static str)>,
     rest_seen: Option<Instant>,
+    last_host_idol_sent: Option<i32>,
 }
 
 impl World {
@@ -585,6 +608,7 @@ impl World {
             self.talk_order.reset();
             self.is_client = !is_host;
             self.epoch_at = Some(now);
+            self.last_host_idol_sent = None;
             self.dump_due = if is_host { peers.iter().map(|p| (p.id, now)).collect() } else { BTreeMap::new() };
             self.dump_done = false;
             self.pending_dump = None;
@@ -756,6 +780,10 @@ impl World {
             let echo = self.rest_from_friend_at.is_some_and(|t| t.elapsed() < REST_ECHO_FOR);
             if !echo {
                 net.send_event(EV_REST, rest, game::current_block().unwrap_or(-1));
+                if is_host && rest > 0 && self.last_host_idol_sent != Some(rest) {
+                    self.last_host_idol_sent = Some(rest);
+                    net.send_event(EV_HOST_IDOL, rest, 0);
+                }
                 log::line(&format!("world: rested at idol {rest}, told the friend"));
                 self.own_rest_now = true;
                 // Rest = reset for both (restsync.rs): our enemies just respawned.
@@ -765,6 +793,13 @@ impl World {
             }
         }
         self.last_rest = rest;
+        if is_host {
+            let cur_idol = game::last_idol();
+            if cur_idol > 0 && self.last_host_idol_sent != Some(cur_idol) {
+                self.last_host_idol_sent = Some(cur_idol);
+                net.send_event(EV_HOST_IDOL, cur_idol, 0);
+            }
+        }
 
         // Friend -> us.
         for (id, on) in std::mem::take(&mut self.queued) {
@@ -942,9 +977,30 @@ impl World {
                         }
                     }
                 }
+                EV_WIPE => {
+                    if is_host {
+                        for p in peers.iter().map(|p| p.id).filter(|&p| p != from) {
+                            net.send_event_to(Dest::Peer(p), EV_WIPE, a, b);
+                        }
+                    }
+                    if a > 0 {
+                        crate::persist::clear_boss_encounter(a, "peer boss wipe");
+                    } else {
+                        self.note_wipe(peers);
+                        let player_dead = game::player().and_then(|p| p.hp()).is_some_and(|hp| hp <= 0);
+                        let restored_before_wipe = crate::persist::note_wipe_remote("peer wipe", player_dead, peers);
+                        if !player_dead && !game::remnant() && should_respawn_on_peer_wipe(restored_before_wipe, in_world_for) {
+                            let ok = respawn_all_wipe("peer EV_WIPE");
+                            log::line(&format!(
+                                "world: EV_WIPE (restored_before_wipe={restored_before_wipe}): respawn_all_wipe ok = {ok}"
+                            ));
+                        }
+                    }
+                }
                 _ => log::line(&format!("world: unknown event {kind} ({a}, {b})")),
             }
         }
+        DOWN_SLOTS.store(down_mask(self.peer_world.iter().map(|(id, p)| (id.slot(), p.down))), Ordering::Release);
 
         // NPC talk lock (talklock.rs): follow our conversation, send / refresh / end our lock.
         crate::talklock::tick(net, peers, now);
@@ -1091,6 +1147,9 @@ impl World {
     fn apply_rest(&mut self, from: PeerId, idol: i32, block: i32) {
         let here = game::current_block().unwrap_or(-2);
         self.rest_from_friend_at = Some(Instant::now());
+        if from.is_host() && idol > 0 {
+            crate::join::set_host_idol(idol);
+        }
         // A rest ends the resting peer's boss fight, whatever we do with it.
         self.peer_mut(from).boss = None;
         // Boss rules (SPEC-BOSS-RULES §3.1). Waiting on the death screen: wake up at the
@@ -1172,6 +1231,12 @@ impl World {
         let ok = refill_player_direct();
         let after = p.hp().unwrap_or(-1);
         log::line(&format!("death: refill after the death reload (hp {before} -> {after}, items restocked ok={ok})"));
+    }
+
+    /// Marks the current death reload as already refilled (used when post-boss spectator revive
+    /// applies `refill_player_direct()` immediately so `death_refill` does not run a second time).
+    pub fn mark_death_refilled(&mut self) {
+        self.death_refilled_for = self.own_death_at;
     }
 
     fn peer_mut(&mut self, id: PeerId) -> &mut PeerWorld {
@@ -1263,9 +1328,16 @@ impl World {
     /// client already in the session must never get one: it would zero its records).
     fn host_dump(&mut self, net: &mut Net, now: Instant) {
         if !tuning::world_on_join() {
+            let idol = game::last_idol();
             for id in std::mem::take(&mut self.dump_due).into_keys() {
+                if idol > 0 {
+                    net.send_event_to(Dest::Peer(id), EV_HOST_IDOL, idol, 0);
+                }
                 net.send_bulk_to(Dest::Peer(id), BULK_FLAGS, &encode_flag_dump(FLAG_DUMP_DISABLED, &[]));
                 log::line(&format!("world: join snapshot off here, told peer {} not to wait", id.slot()));
+            }
+            if idol > 0 {
+                self.last_host_idol_sent = Some(idol);
             }
             return;
         }
@@ -1273,8 +1345,12 @@ impl World {
             // Loading, or in a Remnant memory (bank 1): try again next frame.
             let late: Vec<PeerId> =
                 self.dump_due.iter().filter(|(_, t)| now.duration_since(**t) >= DUMP_HOST_WAIT).map(|(id, _)| *id).collect();
+            let idol = game::last_idol();
             for id in late {
                 self.dump_due.remove(&id);
+                if idol > 0 {
+                    net.send_event_to(Dest::Peer(id), EV_HOST_IDOL, idol, 0);
+                }
                 net.send_bulk_to(Dest::Peer(id), BULK_FLAGS, &encode_flag_dump(FLAG_DUMP_UNAVAILABLE, &[]));
                 log::line(&format!("world: our flags are not readable (Remnant or loading), no join snapshot for peer {}", id.slot()));
             }
@@ -1300,12 +1376,17 @@ impl World {
         // The story phase (group 0, k = 8: not in the records above), right after them.
         let phase = phase_mask(|id| get_flag(fm, id));
         self.phase_sent = Some(phase);
+        let idol = game::last_idol();
         for &id in &due {
-            ok &= net.send_bulk_to(Dest::Peer(id), BULK_FLAGS, &data);
-            ok &= net.send_bulk_to(Dest::Peer(id), BULK_PHASE, &encode_phase(phase));
             // The joiner warps to our idol, not to the first idol of our map (live 2026-10-23:
             // host at the temple, joiner warped to the Outskirts idol first, then teleported back).
-            net.send_event_to(Dest::Peer(id), EV_HOST_IDOL, game::last_idol(), 0);
+            // Send EV_HOST_IDOL before BULK_FLAGS so the joiner's warp decision sees it immediately.
+            net.send_event_to(Dest::Peer(id), EV_HOST_IDOL, idol, 0);
+            ok &= net.send_bulk_to(Dest::Peer(id), BULK_FLAGS, &data);
+            ok &= net.send_bulk_to(Dest::Peer(id), BULK_PHASE, &encode_phase(phase));
+        }
+        if idol > 0 {
+            self.last_host_idol_sent = Some(idol);
         }
         log::line(&format!(
             "world: join snapshot sent to peer(s) {:?} (ok = {ok}), story phase {}: {} shared records ({raw_bytes} B), {} non-zero, {} B on the wire, {:.1} ms; classes {}",
@@ -1470,7 +1551,7 @@ impl World {
                 missing += 1;
                 continue;
             };
-            if !should_sync(base_id + 1) {
+            if !is_shared_record_base(*base_id) {
                 missing += 1;
                 continue;
             }
@@ -1540,8 +1621,8 @@ pub fn restock_items() -> bool {
 }
 
 /// A rest for a player whose idol is not loaded here: `Rest(player, 100)` (`0xA2BE40`: HP,
-/// gourd, resurrection) plus the item restock.
-fn refill_player_direct() -> bool {
+/// gourd, resurrection) plus the item restock (`0x7A95B0` from Storage Box). Game thread only.
+pub fn refill_player_direct() -> bool {
     let Some(p) = game::player() else { return false };
     let rest: extern "C" fn(usize, i32) = unsafe { std::mem::transmute(base() + PLAYER_REST_RVA) };
     rest(p.0, 100);
@@ -1550,6 +1631,31 @@ fn refill_player_direct() -> bool {
 
 /// `respawn_all` for a rest of the friend's (or a resync): recorded in restsync.rs, so
 /// both players' kill bookkeeping and the native session follow the reset.
+static LAST_WIPE_RESPAWN_MS: AtomicU64 = AtomicU64::new(0);
+const WIPE_RESPAWN_COOLDOWN_MS: u64 = 3_000;
+
+pub(crate) fn should_respawn_on_peer_wipe(restored_before_wipe: bool, in_world_for: Duration) -> bool {
+    restored_before_wipe || in_world_for >= Duration::from_secs(15)
+}
+
+/// Respawns all regular/miniboss enemies in the loaded world after a full party wipe and
+/// notifies `restsync` so both peers' dead-enemy tracking clears together. Debounced against
+/// duplicate local + remote wipe notifications within `WIPE_RESPAWN_COOLDOWN_MS`.
+pub fn respawn_all_wipe(why: &str) -> bool {
+    let now = game::now_ms();
+    let prev = LAST_WIPE_RESPAWN_MS.load(Ordering::Acquire);
+    if prev != 0 && now.saturating_sub(prev) < WIPE_RESPAWN_COOLDOWN_MS {
+        return false;
+    }
+    let ok = respawn_all();
+    if ok {
+        LAST_WIPE_RESPAWN_MS.store(now, Ordering::Release);
+        crate::restsync::note_wipe(game::last_idol(), why);
+    }
+    log::line(&format!("world: respawn_all_wipe({why}) -> ok={ok}"));
+    ok
+}
+
 pub fn respawn_all_noted(idol: i32) -> bool {
     let ok = respawn_all();
     if ok {
@@ -1559,11 +1665,16 @@ pub fn respawn_all_noted(idol: i32) -> bool {
 }
 
 impl World {
-    /// Keeps our own death-penalty flags (9500..9599) across the join dump,
-    /// which copies the host's whole 9000-9999 record.
+    /// Keeps our own death-penalty flags (9500..9599) and per-player Sculptor state across join dumps,
+    /// which copy the host's whole 9000-9999 record (and Sculptor records).
     fn own_death_flags(&self, fm: usize) -> Vec<(u32, bool)> {
         let get: extern "C" fn(usize, u32, bool) -> bool = unsafe { std::mem::transmute(base() + GET_EVENT_FLAG_RVA) };
-        (9500..=9599).chain(PER_PLAYER_STATE).map(|id| (id, get(fm, id, false))).collect()
+        (9500..=9599)
+            .chain(PER_PLAYER_STATE)
+            .chain(SCULPTOR_PROSTHETIC_HANDSHAKE)
+            .chain(SCULPTOR_PROSTHETIC_TOOLS)
+            .map(|id| (id, get(fm, id, false)))
+            .collect()
     }
 
     fn restore_death_flags(&self, fm: usize, flags: &[(u32, bool)]) {
@@ -1592,6 +1703,45 @@ fn down_mask(peers: impl Iterator<Item = (u8, bool)>) -> u32 {
 }
 
 static ITEM_FLAGS: std::sync::OnceLock<std::collections::HashSet<u32>> = std::sync::OnceLock::new();
+
+/// Expands each `(event_flag, sell_quantity)` pair from `ShopLineupParam` into all
+/// event-flag IDs that belong to that shop row's stock storage:
+/// - `sell_quantity <= 1` uses the single flag bit (`event_flag`).
+/// - `sell_quantity > 1` stores a multi-bit counter across `[event_flag .. event_flag + bits)`,
+///   clamped to the 1000-flag record boundary and strictly before the next distinct shop row's
+///   `event_flag` so neighboring rows or unrelated adjacent flags are never shadowed.
+pub(crate) fn expand_shop_stock_flags(rows: &[(i32, i16)]) -> Vec<u32> {
+    let mut sorted_flags: Vec<u32> = rows
+        .iter()
+        .filter_map(|&(flag, _)| (flag > 0).then_some(flag as u32))
+        .collect();
+    sorted_flags.sort_unstable();
+    sorted_flags.dedup();
+
+    let mut out = std::collections::BTreeSet::new();
+    for &(flag, sell_qty) in rows {
+        if flag <= 0 {
+            continue;
+        }
+        let f = flag as u32;
+        if sell_qty <= 1 {
+            out.insert(f);
+            continue;
+        }
+        let min_bits = (u32::BITS - (sell_qty as u32).leading_zeros()).max(1);
+        let target_bits = min_bits.max(8);
+        let record_cap = ((f - f % 1000) + 1000).saturating_sub(f).max(1);
+        let next_idx = sorted_flags.partition_point(|&x| x <= f);
+        let gap_cap = sorted_flags
+            .get(next_idx)
+            .map_or(target_bits, |&nf| nf.saturating_sub(f).max(1));
+        let bits = target_bits.min(record_cap).min(gap_cap).max(1);
+        for off in 0..bits {
+            out.insert(f + off);
+        }
+    }
+    out.into_iter().collect()
+}
 
 fn item_flags() -> Option<&'static std::collections::HashSet<u32>> {
     use fromsoftware_shared::FromStatic;
@@ -1627,13 +1777,13 @@ fn item_flags() -> Option<&'static std::collections::HashSet<u32>> {
         i += 1;
     }
     let lots = i;
-    let mut j = 0;
-    while let Some(r) = unsafe { shops_file.get_row_by_index::<SHOP_LINEUP_PARAM>(j) } {
-        if r.event_flag() > 0 {
-            set.insert(r.event_flag() as u32);
-        }
-        j += 1;
-    }
+    let shop_rows: Vec<(i32, i16)> = unsafe { shops_file.rows::<SHOP_LINEUP_PARAM>() }
+        .map(|(_, r)| (r.event_flag(), r.sell_quantity()))
+        .collect();
+    let shop_row_count = shop_rows.len();
+    let expanded_shop = expand_shop_stock_flags(&shop_rows);
+    let shop_flag_count = expanded_shop.len();
+    set.extend(expanded_shop);
     // Learned skills are event flags too (SkillParam `unlockEventFlag`): per player,
     // like items (ownworld.rs, 2026-10-23). Optional: a missing table only logs.
     let mut skills = 0;
@@ -1665,7 +1815,7 @@ fn item_flags() -> Option<&'static std::collections::HashSet<u32>> {
         return None;
     }
     log::line(&format!(
-        "world: {} item/shop/skill/tutorial flags are per player ({lots} item lots, {j} shop rows, {skills} skill flags, {tutorials} tutorial flags)",
+        "world: {} item/shop/skill/tutorial flags are per player ({lots} item lots, {shop_row_count} shop rows / {shop_flag_count} shop flag bits, {skills} skill flags, {tutorials} tutorial flags)",
         set.len()
     ));
     Some(ITEM_FLAGS.get_or_init(|| set))
@@ -1700,7 +1850,10 @@ impl World {
     /// Our own item/shop flags inside the shared records the join dump will
     /// overwrite (the host's pickups must not take our items).
     fn own_item_flags(&self, fm: usize, record_bases: impl Iterator<Item = u32>) -> Vec<(u32, bool)> {
-        let Some(items) = item_flags() else { return Vec::new() };
+        let Some(items) = item_flags() else {
+            log::line("world: WARNING item_flags unavailable during join snapshot; per-player item/shop flags could not be preserved");
+            return Vec::new();
+        };
         let get: extern "C" fn(usize, u32, bool) -> bool = unsafe { std::mem::transmute(base() + GET_EVENT_FLAG_RVA) };
         // A record covers 1000 flags from its base id.
         let bases: std::collections::HashSet<u32> = record_bases.collect();
@@ -2058,6 +2211,45 @@ mod diff_tests {
         assert_eq!(StoryPhase::from_mask(phase_mask(|id| id == 71_110_020)), StoryPhase::Shura);
         assert_eq!(StoryPhase::from_mask(phase_mask(|id| id == 11_110_900)), StoryPhase::Shura);
     }
+
+    #[test]
+    fn expand_shop_stock_flags_handles_single_multibit_gaps_and_record_bounds() {
+        // Empty / invalid rows skipped; sell_quantity == 1 keeps 1 bit; infinite with flag keeps 1 bit.
+        assert_eq!(expand_shop_stock_flags(&[(-1, 5), (0, 1), (71_100_900, 1), (71_100_905, -1)]), vec![71_100_900, 71_100_905]);
+
+        // sell_quantity > 1 expands 8 bits when spaced cleanly.
+        let spaced = expand_shop_stock_flags(&[(71_100_900, 5), (71_100_910, 3)]);
+        let mut expected: Vec<u32> = (71_100_900..=71_100_907).chain(71_100_910..=71_100_917).collect();
+        expected.sort_unstable();
+        assert_eq!(spaced, expected);
+
+        // Tightly packed next row caps bit expansion at the gap.
+        let capped_gap = expand_shop_stock_flags(&[(71_100_900, 3), (71_100_902, 1)]);
+        assert_eq!(capped_gap, vec![71_100_900, 71_100_901, 71_100_902]);
+
+        // sell_quantity > 255 expands min_bits = 9 when gap & record boundary allow.
+        let wide = expand_shop_stock_flags(&[(71_100_100, 300)]);
+        assert_eq!(wide, (71_100_100..=71_100_108).collect::<Vec<_>>());
+
+        // Never crosses 1000-flag record boundary.
+        let boundary = expand_shop_stock_flags(&[(71_100_996, 10)]);
+        assert_eq!(boundary, vec![71_100_996, 71_100_997, 71_100_998, 71_100_999]);
+    }
+
+    #[test]
+    fn shared_record_base_matches_shared_ks() {
+        for g in 0..10u32 {
+            let expected_ks = shared_ks(g);
+            for k in 0..10u32 {
+                let base_id = g * 10_000_000 + 11 * 100_000 + k * 1000;
+                assert_eq!(
+                    is_shared_record_base(base_id),
+                    expected_ks.contains(&k),
+                    "group {g}, k {k}"
+                );
+            }
+        }
+    }
 }
 
 // ---- Raw record access for ownworld.rs (the joiner's own world, 2026-10-23) ----
@@ -2165,5 +2357,39 @@ pub(crate) fn write_phase(fm: usize, mask: u32) {
     let set: extern "C" fn(usize, u32, bool, bool) = unsafe { std::mem::transmute(base() + SET_EVENT_FLAG_RVA) };
     for (id, on) in mask_flags(mask) {
         set(fm, id, on, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sculptor_prosthetic_flags_are_per_player_and_never_synced() {
+        for id in [71_100_125, 71_100_127, 71_100_128, 71_101_600, 71_101_619] {
+            assert!(per_player_state(id), "expected per_player_state({id})");
+            assert!(!should_sync(id), "expected !should_sync({id})");
+        }
+        assert!(!per_player_state(71_100_124));
+        assert!(!per_player_state(71_100_129));
+        assert!(!per_player_state(71_101_599));
+        assert!(!per_player_state(71_101_620));
+    }
+
+    #[test]
+    fn group_2_k5_combat_zone_flags_stay_local() {
+        for id in [21_005_050, 21_005_049, 21_005_123] {
+            assert!(!should_sync(id), "group 2 k=5 flag {id} should stay local");
+        }
+        assert!(should_sync(21_114_177), "group 2 k=4 stays synced");
+        assert!(should_sync(11_125_670), "group 1 k=5 stays synced");
+    }
+
+    #[test]
+    fn peer_wipe_respawn_skips_fresh_reload() {
+        assert!(!should_respawn_on_peer_wipe(false, Duration::from_secs(2)));
+        assert!(!should_respawn_on_peer_wipe(false, Duration::from_secs(14)));
+        assert!(should_respawn_on_peer_wipe(true, Duration::from_secs(2)));
+        assert!(should_respawn_on_peer_wipe(false, Duration::from_secs(15)));
     }
 }

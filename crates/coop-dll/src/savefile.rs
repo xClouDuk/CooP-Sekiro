@@ -653,6 +653,19 @@ fn scan_readable_sections_for_iat(
     };
     let sec_base = opt + size_of_opt as usize;
     let align = size_of::<usize>();
+    let mut min_addr = usize::MAX;
+    let mut max_addr = 0usize;
+    for &(exp, _) in kernel_exports {
+        min_addr = min_addr.min(exp);
+        max_addr = max_addr.max(exp);
+    }
+    for t in targets {
+        min_addr = min_addr.min(t.hook_addr);
+        max_addr = max_addr.max(t.hook_addr);
+    }
+    if max_addr == 0 {
+        return (0, 0);
+    }
     let mut patched = 0usize;
     let mut already = 0usize;
 
@@ -713,7 +726,7 @@ fn scan_readable_sections_for_iat(
                 let mut addr = (cursor + (align - 1)) & !(align - 1);
                 while addr + align <= reg_end {
                     let val = unsafe { *(addr as *const usize) };
-                    if val != 0 {
+                    if val >= min_addr && val <= max_addr {
                         if let Some(&(_, t)) = kernel_exports.iter().find(|(exp, _)| *exp == val) {
                             if unsafe { patch_iat_slot(addr as *mut usize, t) } {
                                 patched += 1;
@@ -896,7 +909,7 @@ pub fn install() {
                     let _ = reinstall_iat();
                     if SECTION_HOOKED.load(Ordering::Acquire) {
                         settle_polls += 1;
-                        if settle_polls >= 40 {
+                        if settle_polls >= 8 {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(45));

@@ -17,6 +17,71 @@ use hudhook::{Hudhook, ImguiRenderLoop, MessageFilter, RenderContext};
 use crate::peers::PeerId;
 use crate::{log, settings, tuning};
 
+/// True when the last observed user input came from an XInput controller; false for keyboard/mouse.
+static INPUT_IS_PAD: AtomicBool = AtomicBool::new(false);
+
+pub fn is_pad_mode() -> bool {
+    INPUT_IS_PAD.load(Ordering::Relaxed)
+}
+
+/// True when world-space player overlays (nameplates, edge markers, lock mark, party HUD)
+/// should be visible (in-world, not mid-warp, no menu open, and not in a cutscene).
+static HUD_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_hud_visible(visible: bool) {
+    HUD_VISIBLE.store(visible, Ordering::Relaxed);
+}
+
+pub fn hud_visible() -> bool {
+    HUD_VISIBLE.load(Ordering::Relaxed)
+}
+
+pub fn should_show_world_hud(
+    in_world: bool,
+    hands_off: bool,
+    menu_mask: Option<u32>,
+    cutscene_active: bool,
+) -> bool {
+    in_world && !hands_off && menu_mask == Some(0) && !cutscene_active
+}
+
+/// Pure input-mode state transition: only flips when one source shows clear activity alone.
+pub fn detect_input_mode(prev_pad: bool, pad_active: bool, kbm_active: bool) -> bool {
+    if pad_active && !kbm_active {
+        true
+    } else if kbm_active && !pad_active {
+        false
+    } else {
+        prev_pad
+    }
+}
+
+fn pad_has_activity(pad: Option<crate::spectate_input::PadState>) -> bool {
+    pad.is_some_and(crate::spectate_input::pad_has_input)
+}
+
+fn kbm_has_activity(ui: &Ui) -> bool {
+    let io = ui.io();
+    let delta = io.mouse_delta[0].abs() + io.mouse_delta[1].abs();
+    if delta > 2.5
+        || io.mouse_down.iter().any(|&b| b)
+        || io.mouse_wheel.abs() > 0.0
+        || io.mouse_wheel_h.abs() > 0.0
+        || io.keys_down.iter().any(|&k| k)
+        || io.key_ctrl
+        || io.key_shift
+        || io.key_alt
+        || io.key_super
+    {
+        return true;
+    }
+    Key::VARIANTS
+        .iter()
+        .copied()
+        .filter(|&k| (k as u32) <= (Key::KeypadEqual as u32))
+        .any(|k| ui.is_key_down(k))
+}
+
 /// Game task → overlay.
 #[derive(Default, Clone)]
 pub struct Status {
@@ -158,7 +223,13 @@ fn post(f: impl FnOnce(&mut Commands)) {
 /// only in docs/JATKA-TASTA-MULTIPLAYER.md. 1.0.1-beta: SprjTask lookup retried (Nexus "no ini" reports). 1.0.2-beta: clean public build (build-public.cmd). 1.0.3-beta: Steam lobby AccessDenied explained, joiner without a host told how to use UDP. 1.0.4-beta: co-op items work on non-English games (template row by id). 1.0.5-beta: Kuro's Charm follows the host during a session. 1.0.6-beta: no void fall after a cutscene that changes the map, bosses scaled on every machine. 1.0.7-beta: a player who died in a boss fight follows the killer's post-boss warp, doors checked after every load, notice when the last run did not close normally. 1.0.8-beta: the joiner's own-world restore no longer wipes areas it never saw (closed doors, replayed cutscenes) and mirrors a world behind the host's, Sword Saint's gauge gap is no retreat, a stuck-input watchdog, a living player leaves a phase A wait. 1.0.9-beta: players are warned when their mod versions differ on the same protocol, talk-lock diagnostics.
 /// 1.3.1-beta: CooP Sekiro fork by xCløuD: apply ultrawide resolution table and 16:9 clamp
 /// bypass early at boot before GraphicsConfig.xml initializes the initial viewport.
-pub const MOD_VERSION: &str = "1.3.1-beta";
+/// 1.3.5-beta: Native Steam Invite mode (private invite-only lobbies with per-lobby ephemeral
+/// token auth, lobby-member transport allowlist, Kindred Bell invite menu, quit-while-hosting
+/// protection, and performance sweep; steam_invites = 1 by default).
+/// 1.3.6-beta: Verified boss/miniboss/Great Serpent/Raven deathblow & single-player lockout
+/// hardening (client stealth/event claims on untouched minibosses & c5010, Type-5 deathblow
+/// guard, long-throw lock extension up to 12 s) and player-to-player consumable/upgrade item drop & pickup.
+pub const MOD_VERSION: &str = "1.3.6-beta";
 
 const YELLOW: [f32; 4] = [1.0, 0.85, 0.3, 1.0];
 /// Nameplate: full opacity up to this distance, then slowly lighter.
@@ -171,6 +242,502 @@ const SHOW_DIST_FROM_M: f32 = 40.0;
 #[derive(Default)]
 struct Overlay {
     panel: Panel,
+    drop_panel: DropPanel,
+}
+
+const PAD_DPAD_UP: u16 = 0x0001;
+const PAD_DPAD_DOWN: u16 = 0x0002;
+const PAD_DPAD_LEFT: u16 = 0x0004;
+const PAD_DPAD_RIGHT: u16 = 0x0008;
+const PAD_R3: u16 = 0x0080;
+const PAD_LB: u16 = 0x0100;
+const PAD_RB: u16 = 0x0200;
+const PAD_A: u16 = 0x1000;
+const PAD_B: u16 = 0x2000;
+const PAD_Y: u16 = 0x8000;
+
+const DLG_STICK_THRESHOLD: i32 = 18_000;
+const DLG_FIRST_DELAY_MS: u64 = 350;
+const DLG_X_REPEAT_MS: u64 = 90;
+const DLG_Y_REPEAT_MS: u64 = 120;
+
+/// Natural controller navigation for the Drop Quantity Dialog using D-pad + either analog stick.
+#[derive(Default, Debug)]
+struct DialogPadNav {
+    x_dir: i8,
+    x_next_ms: u64,
+    y_dir: i8,
+    y_next_ms: u64,
+}
+
+impl DialogPadNav {
+    fn step(&mut self, pad: Option<crate::spectate_input::PadState>, now_ms: u64) -> i32 {
+        let Some(p) = pad else {
+            *self = Self::default();
+            return 0;
+        };
+        let x = if (p.buttons & PAD_DPAD_RIGHT) != 0
+            || (p.lx as i32) > DLG_STICK_THRESHOLD
+            || (p.rx as i32) > DLG_STICK_THRESHOLD
+        {
+            1i8
+        } else if (p.buttons & PAD_DPAD_LEFT) != 0
+            || (p.lx as i32) < -DLG_STICK_THRESHOLD
+            || (p.rx as i32) < -DLG_STICK_THRESHOLD
+        {
+            -1i8
+        } else {
+            0i8
+        };
+        let y = if (p.buttons & PAD_DPAD_UP) != 0
+            || (p.ly as i32) > DLG_STICK_THRESHOLD
+            || (p.ry as i32) > DLG_STICK_THRESHOLD
+        {
+            1i8
+        } else if (p.buttons & PAD_DPAD_DOWN) != 0
+            || (p.ly as i32) < -DLG_STICK_THRESHOLD
+            || (p.ry as i32) < -DLG_STICK_THRESHOLD
+        {
+            -1i8
+        } else {
+            0i8
+        };
+
+        let mut delta = 0i32;
+        if x == 0 {
+            self.x_dir = 0;
+        } else if x != self.x_dir || now_ms >= self.x_next_ms {
+            let first = x != self.x_dir;
+            self.x_dir = x;
+            self.x_next_ms = now_ms + if first { DLG_FIRST_DELAY_MS } else { DLG_X_REPEAT_MS };
+            delta += x as i32;
+        }
+        if y == 0 {
+            self.y_dir = 0;
+        } else if y != self.y_dir || now_ms >= self.y_next_ms {
+            let first = y != self.y_dir;
+            self.y_dir = y;
+            self.y_next_ms = now_ms + if first { DLG_FIRST_DELAY_MS } else { DLG_Y_REPEAT_MS };
+            delta += (y as i32) * 5;
+        }
+        delta
+    }
+}
+
+struct DropDialog {
+    full_id: u32,
+    name: String,
+    max_qty: u32,
+    qty: u32,
+    just_opened: bool,
+}
+
+#[derive(Default)]
+struct DropPanel {
+    open_hotkey: bool,
+    collapsed: bool,
+    selected: usize,
+    qty: u32,
+    last_item: u32,
+    nav: crate::menu::PadNav,
+    dialog: Option<DropDialog>,
+    dialog_nav: DialogPadNav,
+    pad_a_was_down: bool,
+    pad_b_was_down: bool,
+    pad_y_was_down: bool,
+    pad_lb_was_down: bool,
+    pad_rb_was_down: bool,
+    pad_r3_was_down: bool,
+}
+
+impl DropPanel {
+    fn draw(&mut self, ui: &Ui, snap: &crate::itemdrop::UiSnapshot, pad: Option<crate::spectate_input::PadState>) {
+        use crate::menu::NavAction;
+        if !snap.connected {
+            self.open_hotkey = false;
+            self.collapsed = false;
+            self.nav = crate::menu::PadNav::default();
+            self.dialog = None;
+            self.dialog_nav = DialogPadNav::default();
+            self.pad_a_was_down = false;
+            self.pad_b_was_down = false;
+            self.pad_y_was_down = false;
+            self.pad_lb_was_down = false;
+            self.pad_rb_was_down = false;
+            self.pad_r3_was_down = false;
+            crate::inputblock::set_dialog_open(false);
+            crate::itemdrop::set_panel_visible(false);
+            return;
+        }
+
+        let focused = crate::spectate_input::game_focused();
+        let pad_mode = is_pad_mode();
+        let pad_a_down = pad.is_some_and(|p| p.buttons & PAD_A != 0);
+        let pad_b_down = pad.is_some_and(|p| p.buttons & PAD_B != 0);
+        let pad_y_down = pad.is_some_and(|p| p.buttons & PAD_Y != 0);
+        let pad_lb_down = pad.is_some_and(|p| p.buttons & PAD_LB != 0);
+        let pad_rb_down = pad.is_some_and(|p| p.buttons & PAD_RB != 0);
+        let pad_r3_down = pad.is_some_and(|p| p.buttons & PAD_R3 != 0);
+        let pad_a_edge = pad_a_down && !self.pad_a_was_down;
+        let pad_b_edge = pad_b_down && !self.pad_b_was_down;
+        let pad_y_edge = pad_y_down && !self.pad_y_was_down;
+        let pad_lb_edge = pad_lb_down && !self.pad_lb_was_down;
+        let pad_rb_edge = pad_rb_down && !self.pad_rb_was_down;
+        let pad_r3_edge = pad_r3_down && !self.pad_r3_was_down;
+        self.pad_a_was_down = pad_a_down;
+        self.pad_b_was_down = pad_b_down;
+        self.pad_y_was_down = pad_y_down;
+        self.pad_lb_was_down = pad_lb_down;
+        self.pad_rb_was_down = pad_rb_down;
+        self.pad_r3_was_down = pad_r3_down;
+
+        if focused && ui.is_key_pressed_no_repeat(Key::F6) {
+            self.open_hotkey = !self.open_hotkey;
+            self.collapsed = false;
+        }
+        if self.open_hotkey && self.dialog.is_none() && focused && ui.is_key_pressed_no_repeat(Key::Escape) {
+            self.open_hotkey = false;
+        }
+
+        let [dw, dh] = ui.io().display_size;
+        let settings_up = PANEL_VISIBLE.load(Ordering::Relaxed);
+
+        // Feedback toast (visible whether Inventory, world, or F6 drawer is up).
+        if let Some(fb) = &snap.feedback
+            && dw >= 1.0
+            && dh >= 1.0
+        {
+            let dl = ui.get_foreground_draw_list();
+            let [tw, th] = ui.calc_text_size(fb);
+            let cx = dw * 0.5;
+            let cy = dh * 0.14;
+            let (px, py) = (16.0, 8.0);
+            let r = [cx - tw * 0.5 - px, cy - th * 0.5 - py, cx + tw * 0.5 + px, cy + th * 0.5 + py];
+            dl.add_rect([r[0], r[1]], [r[2], r[3]], [0.06, 0.05, 0.04, 0.88]).filled(true).rounding(6.0).build();
+            dl.add_rect([r[0], r[1]], [r[2], r[3]], [0.92, 0.86, 0.68, 0.85]).rounding(6.0).thickness(1.5).build();
+            dl.add_text([cx - tw * 0.5, cy - th * 0.5], [1.0, 0.96, 0.84, 1.0], fb);
+        }
+
+        // Hover-to-drop prompt in Sekiro Inventory + Y/Triangle open trigger.
+        if snap.in_inventory_menu && self.dialog.is_none()
+            && let Some(hovered) = &snap.hovered_droppable
+        {
+            if dw >= 1.0 && dh >= 1.0 {
+                let prompt = if pad_mode {
+                    format!("[Y / Triangle] Drop {} (held: {})", hovered.name, hovered.qty)
+                } else {
+                    format!("[Y] Drop {} (held: {})", hovered.name, hovered.qty)
+                };
+                let dl = ui.get_foreground_draw_list();
+                let [tw, th] = ui.calc_text_size(&prompt);
+                let cx = dw * 0.5;
+                let cy = dh * 0.885;
+                let (px, py) = (16.0, 7.0);
+                let r = [cx - tw * 0.5 - px, cy - th * 0.5 - py, cx + tw * 0.5 + px, cy + th * 0.5 + py];
+                dl.add_rect([r[0], r[1]], [r[2], r[3]], [0.06, 0.05, 0.04, 0.88]).filled(true).rounding(6.0).build();
+                dl.add_rect([r[0], r[1]], [r[2], r[3]], [0.92, 0.86, 0.68, 0.85]).rounding(6.0).thickness(1.5).build();
+                dl.add_text([cx - tw * 0.5, cy - th * 0.5], [1.0, 0.96, 0.84, 1.0], &prompt);
+            }
+            if pad_y_edge || (focused && ui.is_key_pressed_no_repeat(Key::Y)) {
+                self.dialog = Some(DropDialog {
+                    full_id: hovered.full_id,
+                    name: hovered.name.clone(),
+                    max_qty: hovered.qty,
+                    qty: 1,
+                    just_opened: true,
+                });
+                self.dialog_nav = DialogPadNav::default();
+            }
+        }
+
+        // Auto-close dialog if Inventory menu closes.
+        if self.dialog.is_some() && !snap.in_inventory_menu {
+            self.dialog = None;
+        }
+
+        // Centered Drop Quantity Dialog (background Sekiro menu navigation is paused while open).
+        if let Some(mut dlg) = self.dialog.take() {
+            if let Some(live) = snap.items.iter().find(|it| it.full_id == dlg.full_id && it.qty > 0) {
+                dlg.max_qty = live.qty;
+                dlg.qty = dlg.qty.clamp(1, dlg.max_qty);
+
+                let pad_delta = self.dialog_nav.step(pad, nav_now_ms());
+                if pad_delta != 0 {
+                    dlg.qty = (dlg.qty as i32 + pad_delta).clamp(1, dlg.max_qty as i32) as u32;
+                }
+                if pad_lb_edge {
+                    dlg.qty = 1;
+                }
+                if pad_rb_edge {
+                    dlg.qty = dlg.max_qty;
+                }
+                if focused {
+                    if ui.is_key_pressed_no_repeat(Key::LeftArrow) || ui.is_key_pressed_no_repeat(Key::A) {
+                        dlg.qty = dlg.qty.saturating_sub(1).max(1);
+                    }
+                    if ui.is_key_pressed_no_repeat(Key::RightArrow) || ui.is_key_pressed_no_repeat(Key::D) {
+                        dlg.qty = dlg.qty.saturating_add(1).min(dlg.max_qty);
+                    }
+                    if ui.is_key_pressed_no_repeat(Key::UpArrow) || ui.is_key_pressed_no_repeat(Key::W) {
+                        dlg.qty = dlg.qty.saturating_add(5).min(dlg.max_qty);
+                    }
+                    if ui.is_key_pressed_no_repeat(Key::DownArrow) || ui.is_key_pressed_no_repeat(Key::S) {
+                        dlg.qty = dlg.qty.saturating_sub(5).max(1);
+                    }
+                    if ui.is_key_pressed_no_repeat(Key::Home) {
+                        dlg.qty = 1;
+                    }
+                    if ui.is_key_pressed_no_repeat(Key::End) {
+                        dlg.qty = dlg.max_qty;
+                    }
+                }
+
+                let mut confirm = !dlg.just_opened
+                    && (pad_a_edge
+                        || pad_y_edge
+                        || pad_r3_edge
+                        || (focused
+                            && (ui.is_key_pressed_no_repeat(Key::Enter)
+                                || ui.is_key_pressed_no_repeat(Key::KeypadEnter)
+                                || ui.is_key_pressed_no_repeat(Key::E)
+                                || ui.is_key_pressed_no_repeat(Key::Y))));
+                let mut cancel = pad_b_edge
+                    || (focused
+                        && (ui.is_key_pressed_no_repeat(Key::Escape)
+                            || ui.is_key_pressed_no_repeat(Key::Backspace)));
+
+                let confirm_lbl = if pad_mode {
+                    "Confirm Drop  [A / Y]"
+                } else {
+                    "Confirm Drop  [Enter / Y]"
+                };
+                let cancel_lbl = if pad_mode { "Cancel  [B]" } else { "Cancel  [Esc]" };
+                let (legend_1, legend_2) = if pad_mode {
+                    (
+                        "D-Pad / Sticks: L/R +/-1, U/D +/-5 | LB/RB: Min/Max",
+                        "A / Y: Confirm  |  B: Cancel",
+                    )
+                } else {
+                    (
+                        "Arrows / WASD: L/R +/-1, U/D +/-5 | Home/End: Min/Max",
+                        "Enter / Y: Confirm  |  Esc: Cancel",
+                    )
+                };
+
+                ui.window("Drop Item##coop-drop-dialog")
+                    .position([dw * 0.5, dh * 0.5], Condition::Always)
+                    .position_pivot([0.5, 0.5])
+                    .always_auto_resize(true)
+                    .resizable(false)
+                    .movable(false)
+                    .collapsible(false)
+                    .save_settings(false)
+                    .bg_alpha(0.94)
+                    .build(|| {
+                        ui.text_colored(YELLOW, format!("Drop {}", dlg.name));
+                        ui.text_disabled(format!("Held: {}", dlg.max_qty));
+                        ui.separator();
+                        if dlg.max_qty > 1 {
+                            ui.set_next_item_width(280.0);
+                            let mut v = dlg.qty as i32;
+                            if ui.slider("##drop-qty-slider", 1, dlg.max_qty as i32, &mut v) {
+                                dlg.qty = (v as u32).clamp(1, dlg.max_qty);
+                            }
+                        }
+                        if ui.small_button("Min") {
+                            dlg.qty = 1;
+                        }
+                        ui.same_line();
+                        if ui.small_button("-5") {
+                            dlg.qty = dlg.qty.saturating_sub(5).max(1);
+                        }
+                        ui.same_line();
+                        if ui.small_button("-1") {
+                            dlg.qty = dlg.qty.saturating_sub(1).max(1);
+                        }
+                        ui.same_line();
+                        ui.text(format!("  {} / {}  ", dlg.qty, dlg.max_qty));
+                        ui.same_line();
+                        if ui.small_button("+1") {
+                            dlg.qty = dlg.qty.saturating_add(1).min(dlg.max_qty);
+                        }
+                        ui.same_line();
+                        if ui.small_button("+5") {
+                            dlg.qty = dlg.qty.saturating_add(5).min(dlg.max_qty);
+                        }
+                        ui.same_line();
+                        if ui.small_button("Max") {
+                            dlg.qty = dlg.max_qty;
+                        }
+                        ui.spacing();
+                        ui.separator();
+                        ui.spacing();
+                        if ui.button(confirm_lbl) {
+                            confirm = true;
+                        }
+                        ui.same_line();
+                        if ui.button(cancel_lbl) {
+                            cancel = true;
+                        }
+                        ui.text_disabled(legend_1);
+                        ui.text_disabled(legend_2);
+                    });
+
+                dlg.just_opened = false;
+                if !cancel {
+                    if confirm {
+                        crate::itemdrop::post_drop_request(dlg.full_id, dlg.qty.clamp(1, dlg.max_qty));
+                    } else {
+                        self.dialog = Some(dlg);
+                    }
+                }
+            }
+        } else {
+            self.dialog_nav = DialogPadNav::default();
+        }
+
+        // Sync Sekiro background input block immediately when the dialog opens or closes.
+        crate::inputblock::set_dialog_open(self.dialog.is_some());
+
+        let drawer_visible = self.open_hotkey;
+        crate::itemdrop::set_panel_visible(drawer_visible || self.dialog.is_some());
+        if !drawer_visible {
+            self.nav = crate::menu::PadNav::default();
+            return;
+        }
+
+        if snap.items.is_empty() {
+            self.selected = 0;
+            self.qty = 0;
+            self.last_item = 0;
+        } else {
+            if self.selected >= snap.items.len() {
+                self.selected = snap.items.len() - 1;
+            }
+            let cur = &snap.items[self.selected];
+            if cur.full_id != self.last_item {
+                self.last_item = cur.full_id;
+                self.qty = 1;
+            }
+            self.qty = self.qty.clamp(1, cur.qty);
+        }
+
+        let mut drop_now = false;
+        let pad_on = !self.collapsed && !settings_up && self.dialog.is_none();
+        if pad_on {
+            for act in self.nav.step(pad, nav_now_ms()) {
+                match act {
+                    NavAction::Move(dir) if !snap.items.is_empty() => {
+                        let len = snap.items.len() as i32;
+                        self.selected = (self.selected as i32 + dir).rem_euclid(len) as usize;
+                        let cur = &snap.items[self.selected];
+                        self.last_item = cur.full_id;
+                        self.qty = 1.clamp(1, cur.qty);
+                    }
+                    NavAction::Adjust(n) if !snap.items.is_empty() => {
+                        let max = snap.items[self.selected].qty;
+                        let delta = if n >= 25 {
+                            5
+                        } else if n <= -25 {
+                            -5
+                        } else if n > 0 {
+                            1
+                        } else {
+                            -1
+                        };
+                        self.qty = (self.qty as i32 + delta).clamp(1, max as i32) as u32;
+                    }
+                    NavAction::Apply => drop_now = true,
+                    NavAction::Toggle => self.collapsed = !self.collapsed,
+                    _ => {}
+                }
+            }
+        } else {
+            self.nav = crate::menu::PadNav::default();
+        }
+
+        let width = (dw * 0.19).clamp(270.0, 440.0);
+        let (pos, pivot) = if settings_up { ([12.0, dh * 0.5], [0.0, 0.5]) } else { ([dw - 12.0, dh * 0.5], [1.0, 0.5]) };
+
+        ui.window("Drop Item (Co-op)")
+            .position(pos, Condition::Always)
+            .position_pivot(pivot)
+            .always_auto_resize(true)
+            .resizable(false)
+            .movable(false)
+            .collapsible(false)
+            .focus_on_appearing(false)
+            .save_settings(false)
+            .bg_alpha(0.86)
+            .build(|| {
+                ui.text("Drop Item  [F6]");
+                ui.same_line();
+                if ui.small_button(if self.collapsed { "Expand" } else { "Hide" }) {
+                    self.collapsed = !self.collapsed;
+                }
+                if self.collapsed {
+                    return;
+                }
+                ui.separator();
+                if snap.items.is_empty() {
+                    ui.text_disabled("No droppable consumables or upgrade materials.");
+                } else {
+                    ui.child_window("##coop-drop-list").size([width, 220.0]).border(true).build(|| {
+                        for (i, it) in snap.items.iter().enumerate() {
+                            let selected = i == self.selected;
+                            let label = format!("{} (x{})##drop{i}", it.name, it.qty);
+                            if ui.selectable_config(&label).selected(selected).build() {
+                                self.selected = i;
+                                self.last_item = it.full_id;
+                                self.qty = 1.clamp(1, it.qty);
+                            }
+                        }
+                    });
+                    let cur = &snap.items[self.selected];
+                    ui.text_colored(YELLOW, format!("Selected: {} (owned: {})", cur.name, cur.qty));
+                    if ui.small_button("-5") {
+                        self.qty = self.qty.saturating_sub(5).max(1);
+                    }
+                    ui.same_line();
+                    if ui.small_button("-1") {
+                        self.qty = self.qty.saturating_sub(1).max(1);
+                    }
+                    ui.same_line();
+                    ui.text(format!("Qty: {}", self.qty));
+                    ui.same_line();
+                    if ui.small_button("+1") {
+                        self.qty = self.qty.saturating_add(1).min(cur.qty);
+                    }
+                    ui.same_line();
+                    if ui.small_button("+5") {
+                        self.qty = self.qty.saturating_add(5).min(cur.qty);
+                    }
+                    ui.same_line();
+                    if ui.small_button("All") {
+                        self.qty = cur.qty;
+                    }
+                    if ui.button("Drop Item") {
+                        drop_now = true;
+                    }
+                }
+                if let Some(fb) = &snap.feedback {
+                    ui.text_colored(YELLOW, fb);
+                }
+                if pad_mode {
+                    ui.text_disabled("Tip: Hover item in Inventory and press Y / Triangle.");
+                    if pad_on {
+                        ui.text_disabled("Pad: R-Stick = select/qty, RT = Drop");
+                    }
+                } else {
+                    ui.text_disabled("Tip: Hover item in Inventory and press Y.");
+                    ui.text_disabled("Mouse: click item & quantity, or click Drop Item");
+                }
+            });
+
+        if drop_now && let Some(cur) = snap.items.get(self.selected) {
+            crate::itemdrop::post_drop_request(cur.full_id, self.qty.clamp(1, cur.qty));
+        }
+    }
 }
 
 /// The 'Mod settings' panel is on screen right now (render thread writes, `message_filter`
@@ -259,7 +826,7 @@ impl Panel {
         let width = (dw * 0.17).clamp(260.0, 520.0);
         let mut apply = false;
         // Controller: right stick / triggers / R3 only (render thread; XInputGetState only).
-        let pad_on = editable && !self.collapsed && tuning::ingame_menu_pad();
+        let pad_on = editable && !self.collapsed && tuning::ingame_menu_pad() && !crate::inputblock::blocked();
         if pad_on {
             let now = nav_now_ms();
             for a in self.nav.step(crate::spectate_input::pad_state(), now) {
@@ -352,40 +919,64 @@ impl Panel {
     }
 }
 
+struct Camera {
+    rows: [[f32; 4]; 4],
+    fov: f32,
+    near: f32,
+    far: f32,
+}
+
 /// Render camera (right, up, forward, position rows; vertical FOV), None on any failed read.
 /// Spectate lock-on (v8.10): a white dot in a dark ring on the locked target, like the
 /// game's own lock-on marker while alive.
 fn draw_lock_mark(ui: &Ui) {
     let Some(p) = crate::spectate_cam::lock_mark() else { return };
-    let Some((m, fov)) = read_camera() else { return };
+    let Some(cam) = read_camera() else { return };
     let [w, h] = ui.io().display_size;
     if w < 1.0 || h < 1.0 {
         return;
     }
-    let Some([sx, sy]) = project(&m, fov, [w, h], p) else { return };
+    let Some([sx, sy]) = project(&cam.rows, cam.fov, [w, h], p) else { return };
     let dl = ui.get_foreground_draw_list();
     dl.add_circle([sx, sy], 9.0, [0.0, 0.0, 0.0, 0.55]).thickness(3.0).num_segments(24).build();
     dl.add_circle([sx, sy], 5.5, [1.0, 1.0, 1.0, 0.95]).filled(true).num_segments(20).build();
     dl.add_circle([sx, sy], 5.5, [0.85, 0.15, 0.1, 0.9]).thickness(1.5).num_segments(20).build();
 }
 
-/// World point -> screen pixel with the render camera (None behind it or off screen).
-fn project(m: &[[f32; 4]; 4], fov: f32, [w, h]: [f32; 2], p: [f32; 3]) -> Option<[f32; 2]> {
+/// World point -> screen pixel with the render camera (None behind it or outside wide guard bounds).
+fn project_unclipped(m: &[[f32; 4]; 4], fov: f32, [w, h]: [f32; 2], p: [f32; 3]) -> Option<[f32; 2]> {
     let aspect = w / h;
     let vfov = if aspect < 16.0 / 9.0 { 2.0 * ((fov * 0.5).tan() * (16.0 / 9.0) / aspect).atan() } else { fov };
     let d = [p[0] - m[3][0], p[1] - m[3][1], p[2] - m[3][2]];
     let dot = |r: &[f32; 4]| d[0] * r[0] + d[1] * r[1] + d[2] * r[2];
     let (x, y, z) = (dot(&m[0]), dot(&m[1]), dot(&m[2]));
-    if z < 0.3 {
+    if z < 0.2 {
         return None;
     }
     let t = (vfov * 0.5).tan();
     let sx = (0.5 + 0.5 * x / (z * t * aspect)) * w;
     let sy = (0.5 - 0.5 * y / (z * t)) * h;
-    (sx.is_finite() && sy.is_finite() && (0.0..=w).contains(&sx) && (0.0..=h).contains(&sy)).then_some([sx, sy])
+    (sx.is_finite()
+        && sy.is_finite()
+        && (-w..=2.0 * w).contains(&sx)
+        && (-h..=2.0 * h).contains(&sy))
+    .then_some([sx, sy])
 }
 
-fn read_camera() -> Option<([[f32; 4]; 4], f32)> {
+/// World point -> screen pixel with the render camera (None behind it or off screen).
+fn project(m: &[[f32; 4]; 4], fov: f32, [w, h]: [f32; 2], p: [f32; 3]) -> Option<[f32; 2]> {
+    let [sx, sy] = project_unclipped(m, fov, [w, h], p)?;
+    let d = [p[0] - m[3][0], p[1] - m[3][1], p[2] - m[3][2]];
+    let z = d[0] * m[2][0] + d[1] * m[2][1] + d[2] * m[2][2];
+    (z >= 0.3 && (0.0..=w).contains(&sx) && (0.0..=h).contains(&sy)).then_some([sx, sy])
+}
+
+fn draw_filled_quad(dl: &hudhook::imgui::DrawListMut<'_>, p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], col: [f32; 4]) {
+    dl.add_triangle(p0, p1, p2, col).filled(true).build();
+    dl.add_triangle(p0, p2, p3, col).filled(true).build();
+}
+
+fn read_camera() -> Option<Camera> {
     use crate::game::{module_base, read, read_ptr};
     let base = module_base();
     if base == 0 {
@@ -399,11 +990,388 @@ fn read_camera() -> Option<([[f32; 4]; 4], f32)> {
     if rows.iter().flatten().any(|v| !v.is_finite()) || !fov.is_finite() || !(0.05..=3.0).contains(&fov) {
         return None;
     }
-    Some((rows, fov))
+    let near = read::<f32>(cam + 0x58)
+        .filter(|&v| v.is_finite() && v > 0.001 && v < 10.0)
+        .unwrap_or(0.08);
+    let far = read::<f32>(cam + 0x5C)
+        .filter(|&v| v.is_finite() && v > near + 1.0)
+        .unwrap_or(10_000.0);
+    Some(Camera { rows, fov, near, far })
 }
 
 
 impl Overlay {
+    fn draw_item_drops(&self, ui: &Ui, snap: &crate::itemdrop::UiSnapshot) {
+        if !snap.connected || (snap.markers.is_empty() && snap.nearby_drop.is_none()) {
+            return;
+        }
+        let [w, h] = ui.io().display_size;
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        let cam = if snap.markers.is_empty() { None } else { read_camera() };
+        let dl = ui.get_foreground_draw_list();
+        let mut depth_started = false;
+        if let Some(cam) = cam {
+            let m = cam.rows;
+            let fov = cam.fov;
+            let lh = ui.calc_text_size("Ag")[1];
+            let t_sec = nav_now_ms() as f32 * 0.001;
+            let cam_pos = [m[3][0], m[3][1], m[3][2]];
+            let cam_right = [m[0][0], m[0][1], m[0][2]];
+            let cam_fwd = [m[2][0], m[2][1], m[2][2]];
+            let view_z = |wp: [f32; 3]| -> f32 {
+                (wp[0] - cam_pos[0]) * cam_fwd[0]
+                    + (wp[1] - cam_pos[1]) * cam_fwd[1]
+                    + (wp[2] - cam_pos[2]) * cam_fwd[2]
+            };
+
+            // Keep horizontal billboard right vector upright around world Y so the pouch stands naturally.
+            let xz_len = cam_right[0].hypot(cam_right[2]);
+            let right_xz = if xz_len > 1e-3 {
+                [cam_right[0] / xz_len, 0.0, cam_right[2] / xz_len]
+            } else {
+                cam_right
+            };
+
+            // Project and sort markers back-to-front so nearer loot draws cleanly over farther loot.
+            let mut visible: Vec<(f32, &crate::itemdrop::DropMarker, [f32; 2])> = snap
+                .markers
+                .iter()
+                .filter_map(|mk| {
+                    let cz = view_z(mk.pos);
+                    if cz < cam.near {
+                        return None;
+                    }
+                    let anchor_pt = project(&m, fov, [w, h], [mk.pos[0], mk.pos[1] + 0.14, mk.pos[2]])
+                        .or_else(|| project(&m, fov, [w, h], [mk.pos[0], mk.pos[1] + 0.65, mk.pos[2]]))?;
+                    Some((cz, mk, anchor_pt))
+                })
+                .collect();
+            visible.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+            for (cz, mk, [anchor_sx, anchor_sy]) in visible {
+                let p = mk.pos;
+                let seed = (mk.drop_id as u32 % 997) as f32 * 0.017;
+                let pulse = 0.88 + 0.12 * (t_sec * 2.4 + seed).sin();
+
+                let pouch_z = (cz - 0.09).max(cam.near);
+                if crate::depth::push_depth_begin(pouch_z, cam.near, cam.far, 0.06) {
+                    depth_started = true;
+                }
+
+                let to_cam_x = cam_pos[0] - p[0];
+                let to_cam_z = cam_pos[2] - p[2];
+                let to_cam_len = to_cam_x.hypot(to_cam_z);
+                let to_cam_xz = if to_cam_len > 1e-3 {
+                    [to_cam_x / to_cam_len, 0.0, to_cam_z / to_cam_len]
+                } else {
+                    [0.0, 0.0, 1.0]
+                };
+
+                // Soft oval ground shadow directly under the golden cloth pouch.
+                if let Some(sc) = project_unclipped(&m, fov, [w, h], [p[0], p[1] + 0.005, p[2]]) {
+                    let mut ring = [None; 8];
+                    for (i, slot) in ring.iter_mut().enumerate() {
+                        let a = (i as f32) * std::f32::consts::TAU / 8.0;
+                        let wp = [p[0] + a.cos() * 0.125, p[1] + 0.005, p[2] + a.sin() * 0.105];
+                        *slot = project_unclipped(&m, fov, [w, h], wp);
+                    }
+                    for i in 0..8 {
+                        if let (Some(a), Some(b)) = (ring[i], ring[(i + 1) % 8]) {
+                            dl.add_triangle(sc, a, b, [0.0, 0.0, 0.0, 0.44]).filled(true).build();
+                        }
+                    }
+                }
+
+                // Warm golden-amber cloth loot pouch silhouette (vanilla Sekiro ground loot proportions).
+                let pouch_rings: [(f32, f32, [f32; 3]); 7] = [
+                    (0.006, 0.056, [0.52, 0.31, 0.08]), // grounded amber base
+                    (0.044, 0.085, [0.78, 0.50, 0.14]), // lower honey-gold belly
+                    (0.098, 0.087, [0.90, 0.63, 0.18]), // mid belly (paper seal)
+                    (0.146, 0.066, [0.96, 0.74, 0.24]), // upper sunlit gold shoulder
+                    (0.176, 0.032, [0.82, 0.56, 0.16]), // cinched bronze-gold neck
+                    (0.208, 0.052, [1.00, 0.84, 0.34]), // flared bright gathered top
+                    (0.238, 0.036, [1.00, 0.90, 0.48]), // radiant top edge lit by flame
+                ];
+                let mut proj_rings: [Option<[[f32; 2]; 4]>; 7] = [None; 7];
+                for (r_idx, &(yo, hw, _)) in pouch_rings.iter().enumerate() {
+                    let y = p[1] + yo;
+                    let fracs = [-1.0f32, -0.45, 0.45, 1.0];
+                    let mut pts = [[0.0f32; 2]; 4];
+                    let mut ok = true;
+                    for (j, &f) in fracs.iter().enumerate() {
+                        let wp = [
+                            p[0] + right_xz[0] * (hw * f),
+                            y,
+                            p[2] + right_xz[2] * (hw * f),
+                        ];
+                        if let Some(sp) = project_unclipped(&m, fov, [w, h], wp) {
+                            pts[j] = sp;
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        proj_rings[r_idx] = Some(pts);
+                    }
+                }
+                for r_idx in 0..(pouch_rings.len() - 1) {
+                    if let (Some(lo), Some(hi)) = (proj_rings[r_idx], proj_rings[r_idx + 1]) {
+                        let (_, _, rgb0) = pouch_rings[r_idx];
+                        let (_, _, rgb1) = pouch_rings[r_idx + 1];
+                        let mid = [
+                            (rgb0[0] + rgb1[0]) * 0.5,
+                            (rgb0[1] + rgb1[1]) * 0.5,
+                            (rgb0[2] + rgb1[2]) * 0.5,
+                        ];
+                        let col_l = [mid[0] * 0.68, mid[1] * 0.54, mid[2] * 0.36, 0.97];
+                        let col_c = [mid[0], mid[1], mid[2], 0.98];
+                        let col_r = [mid[0] * 0.78, mid[1] * 0.64, mid[2] * 0.44, 0.97];
+                        draw_filled_quad(&dl, lo[0], lo[1], hi[1], hi[0], col_l);
+                        draw_filled_quad(&dl, lo[1], lo[2], hi[2], hi[1], col_c);
+                        draw_filled_quad(&dl, lo[2], lo[3], hi[3], hi[2], col_r);
+                    }
+                }
+                // Warm dark-bronze tie cord around the neck (y = 0.170..0.184).
+                if let (Some(c0), Some(c1), Some(c2), Some(c3)) = (
+                    project_unclipped(&m, fov, [w, h], [p[0] - right_xz[0] * 0.038, p[1] + 0.170, p[2] - right_xz[2] * 0.038]),
+                    project_unclipped(&m, fov, [w, h], [p[0] + right_xz[0] * 0.038, p[1] + 0.170, p[2] + right_xz[2] * 0.038]),
+                    project_unclipped(&m, fov, [w, h], [p[0] + right_xz[0] * 0.038, p[1] + 0.184, p[2] + right_xz[2] * 0.038]),
+                    project_unclipped(&m, fov, [w, h], [p[0] - right_xz[0] * 0.038, p[1] + 0.184, p[2] - right_xz[2] * 0.038]),
+                ) {
+                    draw_filled_quad(&dl, c0, c1, c2, c3, [0.26, 0.15, 0.05, 0.96]);
+                }
+                // Warm dark-amber outer silhouette edge lines.
+                let outline_col = [0.22, 0.13, 0.04, 0.78];
+                for r_idx in 0..(pouch_rings.len() - 1) {
+                    if let (Some(lo), Some(hi)) = (proj_rings[r_idx], proj_rings[r_idx + 1]) {
+                        dl.add_line(lo[0], hi[0], outline_col).thickness(1.1).build();
+                        dl.add_line(lo[3], hi[3], outline_col).thickness(1.1).build();
+                    }
+                }
+
+                // Crisp circular white paper seal medallion on the front belly of the pouch.
+                let seal_world = [
+                    p[0] + to_cam_xz[0] * 0.025,
+                    p[1] + 0.092,
+                    p[2] + to_cam_xz[2] * 0.025,
+                ];
+                if let Some(seal_px) = project_unclipped(&m, fov, [w, h], seal_world) {
+                    let seal_edge = [
+                        seal_world[0] + right_xz[0] * 0.043,
+                        seal_world[1],
+                        seal_world[2] + right_xz[2] * 0.043,
+                    ];
+                    let r_seal = project_unclipped(&m, fov, [w, h], seal_edge)
+                        .map(|sp| (sp[0] - seal_px[0]).hypot(sp[1] - seal_px[1]))
+                        .unwrap_or(0.0);
+                    if r_seal >= 1.4 {
+                        let r_seal = r_seal.min(24.0);
+                        dl.add_circle(seal_px, r_seal, [0.14, 0.11, 0.08, 0.96])
+                            .filled(true)
+                            .num_segments(18)
+                            .build();
+                        dl.add_circle(seal_px, r_seal * 0.84, [0.95, 0.92, 0.83, 0.97])
+                            .filled(true)
+                            .num_segments(18)
+                            .build();
+                        if r_seal >= 3.2 {
+                            dl.add_circle(seal_px, r_seal * 0.28, [0.30, 0.25, 0.19, 0.60])
+                                .filled(true)
+                                .num_segments(10)
+                                .build();
+                        }
+                    }
+                }
+
+                // Warm golden radiant glow blooming from the pouch mouth.
+                let neck_world = [p[0], p[1] + 0.228, p[2]];
+                if let Some(neck_px) = project_unclipped(&m, fov, [w, h], neck_world) {
+                    let side_world = [
+                        neck_world[0] + right_xz[0] * 0.13,
+                        neck_world[1],
+                        neck_world[2] + right_xz[2] * 0.13,
+                    ];
+                    let r_px = project_unclipped(&m, fov, [w, h], side_world)
+                        .map(|sp| ((sp[0] - neck_px[0]).hypot(sp[1] - neck_px[1])).clamp(3.0, 26.0))
+                        .unwrap_or(8.0);
+                    dl.add_circle(neck_px, r_px * 1.50, [0.96, 0.74, 0.22, 0.16 * pulse])
+                        .filled(true)
+                        .num_segments(20)
+                        .build();
+                    dl.add_circle(neck_px, r_px * 0.86, [1.00, 0.85, 0.35, 0.34 * pulse])
+                        .filled(true)
+                        .num_segments(16)
+                        .build();
+                    dl.add_circle(neck_px, (r_px * 0.38).max(1.8), [1.00, 0.96, 0.74, 0.68 * pulse])
+                        .filled(true)
+                        .num_segments(12)
+                        .build();
+                }
+
+                // Tapered upward golden flame plume + luminous central ray (wider base -> crisp tip).
+                let beam_layers = [
+                    (5usize, 0.20f32, 0.96f32, 0.052f32, 0.095f32, 0.22f32, [0.98f32, 0.78, 0.24]),
+                    (4usize, 0.20f32, 0.88f32, 0.032f32, 0.022f32, 0.36f32, [1.00f32, 0.93, 0.58]),
+                ];
+                for (segs, y_bot, y_top, hw_bot, hw_top, base_alpha, rgb) in beam_layers {
+                    for s in 0..segs {
+                        let f0 = s as f32 / segs as f32;
+                        let f1 = (s + 1) as f32 / segs as f32;
+                        let sy0 = p[1] + y_bot + (y_top - y_bot) * f0;
+                        let sy1 = p[1] + y_bot + (y_top - y_bot) * f1;
+                        let w0 = hw_bot + (hw_top - hw_bot) * f0;
+                        let w1 = hw_bot + (hw_top - hw_bot) * f1;
+                        let a_mid = base_alpha * pulse * ((1.0 - f0) * (1.0 - f0) + (1.0 - f1) * (1.0 - f1)) * 0.5;
+                        let bl = [p[0] - right_xz[0] * w0, sy0, p[2] - right_xz[2] * w0];
+                        let br = [p[0] + right_xz[0] * w0, sy0, p[2] + right_xz[2] * w0];
+                        let tr = [p[0] + right_xz[0] * w1, sy1, p[2] + right_xz[2] * w1];
+                        let tl = [p[0] - right_xz[0] * w1, sy1, p[2] - right_xz[2] * w1];
+                        if let (Some(q0), Some(q1), Some(q2), Some(q3)) = (
+                            project_unclipped(&m, fov, [w, h], bl),
+                            project_unclipped(&m, fov, [w, h], br),
+                            project_unclipped(&m, fov, [w, h], tr),
+                            project_unclipped(&m, fov, [w, h], tl),
+                        ) {
+                            draw_filled_quad(&dl, q0, q1, q2, q3, [rgb[0], rgb[1], rgb[2], a_mid]);
+                        }
+                    }
+                }
+                for s in 0..4usize {
+                    let f0 = s as f32 / 4.0;
+                    let f1 = (s + 1) as f32 / 4.0;
+                    let y0 = p[1] + 0.20 + 0.90 * f0;
+                    let y1 = p[1] + 0.20 + 0.90 * f1;
+                    let a_seg = 0.68 * pulse * (1.0 - (f0 + f1) * 0.5);
+                    if let (Some(rp0), Some(rp1)) = (
+                        project_unclipped(&m, fov, [w, h], [p[0], y0, p[2]]),
+                        project_unclipped(&m, fov, [w, h], [p[0], y1, p[2]]),
+                    ) {
+                        dl.add_line(rp0, rp1, [1.00, 0.96, 0.74, a_seg]).thickness(1.5).build();
+                    }
+                }
+
+                // Orbiting warm cream-gold fluttering butterflies + rising golden sparkles.
+                let bfly_params: [(f32, f32, f32); 3] = [
+                    (0.15, 0.39, 0.88),
+                    (0.21, 0.62, -0.74),
+                    (0.17, 0.84, 1.06),
+                ];
+                for (i, &(rad, y_base, speed)) in bfly_params.iter().enumerate() {
+                    let phase_ang = t_sec * speed + seed + (i as f32) * 2.094;
+                    let bx = p[0] + phase_ang.cos() * rad;
+                    let bz = p[2] + phase_ang.sin() * rad;
+                    let by = p[1] + y_base + 0.065 * (t_sec * 1.9 + seed + i as f32).sin();
+                    let bw = [bx, by, bz];
+                    if let Some(bp) = project_unclipped(&m, fov, [w, h], bw) {
+                        let ref_w = [
+                            bx + right_xz[0] * 0.044,
+                            by,
+                            bz + right_xz[2] * 0.044,
+                        ];
+                        let scale = project_unclipped(&m, fov, [w, h], ref_w)
+                            .map(|sp| (sp[0] - bp[0]).hypot(sp[1] - bp[1]))
+                            .unwrap_or(0.0);
+                        if scale >= 1.5 {
+                            let s_px = scale.clamp(2.4, 13.5);
+                            let flap = 0.25 + 0.75 * (t_sec * 10.5 + seed * 3.0 + (i as f32) * 2.1).sin().abs();
+                            let wx = s_px * flap;
+                            let wy = s_px * 0.68;
+                            let tilt = 0.24 * (phase_ang.sin());
+                            let (ct, st) = (tilt.cos(), tilt.sin());
+                            let rot = |dx: f32, dy: f32| -> [f32; 2] {
+                                [bp[0] + dx * ct - dy * st, bp[1] + dx * st + dy * ct]
+                            };
+                            dl.add_circle(bp, s_px * 0.82, [1.00, 0.88, 0.42, 0.20])
+                                .filled(true)
+                                .num_segments(10)
+                                .build();
+                            let top = rot(0.0, -wy * 0.25);
+                            let bot = rot(0.0, wy * 0.45);
+                            let mid = rot(0.0, 0.0);
+                            // Upper left & right wings
+                            dl.add_triangle(top, rot(-wx, -wy * 0.90), rot(-wx * 0.75, wy * 0.12), [1.00, 0.97, 0.84, 0.92])
+                                .filled(true)
+                                .build();
+                            dl.add_triangle(top, rot(wx, -wy * 0.90), rot(wx * 0.75, wy * 0.12), [1.00, 0.97, 0.84, 0.92])
+                                .filled(true)
+                                .build();
+                            // Lower left & right hindwings
+                            dl.add_triangle(mid, rot(-wx * 0.62, wy * 0.10), rot(-wx * 0.42, wy * 0.78), [1.00, 0.91, 0.58, 0.74])
+                                .filled(true)
+                                .build();
+                            dl.add_triangle(mid, rot(wx * 0.62, wy * 0.10), rot(wx * 0.42, wy * 0.78), [1.00, 0.91, 0.58, 0.74])
+                                .filled(true)
+                                .build();
+                            dl.add_line(top, bot, [0.55, 0.40, 0.18, 0.75]).thickness(1.0).build();
+                        }
+                    }
+                }
+                for i in 0..6 {
+                    let phase = (t_sec * 0.42 + i as f32 * 0.166 + seed).fract();
+                    let sway = (0.05 + 0.04 * (i % 2) as f32) * (phase * std::f32::consts::TAU + i as f32 * 1.3).sin();
+                    let my = p[1] + 0.20 + phase * 0.92;
+                    let mote = [p[0] + right_xz[0] * sway, my, p[2] + right_xz[2] * sway];
+                    if let Some(mp) = project_unclipped(&m, fov, [w, h], mote) {
+                        let ma = 0.72 * (phase * std::f32::consts::PI).sin();
+                        let mr = 1.3 + 0.4 * ((i % 3) as f32);
+                        dl.add_circle(mp, mr, [1.00, 0.88, 0.34, ma]).filled(true).num_segments(8).build();
+                    }
+                }
+
+                // Floating item name tag above the golden beam (depth-tested against world geometry).
+                if mk.dist_m <= 25.0 {
+                    let label_world = [p[0], p[1] + 1.18, p[2]];
+                    if let Some([lsx, lsy]) = project(&m, fov, [w, h], label_world) {
+                        let label_z = (view_z(label_world) - 0.04).max(cam.near);
+                        if crate::depth::push_depth_begin(label_z, cam.near, cam.far, 0.06) {
+                            depth_started = true;
+                        }
+                        let tw = ui.calc_text_size(&mk.label)[0];
+                        let pad = 5.0;
+                        let sx = lsx
+                            .clamp(tw * 0.5 + pad + 4.0, w - tw * 0.5 - pad - 4.0);
+                        let _ = anchor_sx;
+                        let _ = anchor_sy;
+                        let ty = (lsy - lh).clamp(6.0, h - lh - 6.0);
+                        dl.add_rect([sx - tw * 0.5 - pad, ty - 2.0], [sx + tw * 0.5 + pad, ty + lh + 2.0], [0.05, 0.04, 0.02, 0.76])
+                            .filled(true)
+                            .rounding(4.0)
+                            .build();
+                        dl.add_rect([sx - tw * 0.5 - pad, ty - 2.0], [sx + tw * 0.5 + pad, ty + lh + 2.0], [0.96, 0.80, 0.36, 0.72])
+                            .rounding(4.0)
+                            .thickness(1.0)
+                            .build();
+                        dl.add_text([sx - tw * 0.5, ty], [1.00, 0.95, 0.76, 1.0], &mk.label);
+                    }
+                }
+            }
+        }
+        if depth_started {
+            crate::depth::push_depth_end();
+        } else if !snap.markers.is_empty() {
+            crate::depth::finish_frame_without_callbacks();
+        }
+        if let Some((name, qty)) = &snap.nearby_drop {
+            let prompt = if is_pad_mode() {
+                format!("[X / Square] Pick up {name} x{qty}")
+            } else {
+                format!("[E] Pick up {name} x{qty}")
+            };
+            let [tw, th] = ui.calc_text_size(&prompt);
+            let cx = w * 0.5;
+            let cy = h * 0.80;
+            let px = 14.0;
+            let py = 7.0;
+            let r = [cx - tw * 0.5 - px, cy - th * 0.5 - py, cx + tw * 0.5 + px, cy + th * 0.5 + py];
+            dl.add_rect([r[0], r[1]], [r[2], r[3]], [0.05, 0.05, 0.05, 0.85]).filled(true).rounding(6.0).build();
+            dl.add_rect([r[0], r[1]], [r[2], r[3]], [0.96, 0.80, 0.36, 0.85]).rounding(6.0).thickness(1.5).build();
+            dl.add_text([cx - tw * 0.5, cy - th * 0.5], [1.0, 0.97, 0.86, 1.0], &prompt);
+        }
+    }
+
     /// Party HP list for `party_hp_position` left / top (head mode is drawn by `draw_tag`).
     /// "L2 R2 Page n/m" under the Co-op Settings page: two drawn trigger icons and the page number (the game has
     /// no picture of the triggers for custom pages, and the key guide row of a page is fixed).
@@ -511,7 +1479,7 @@ impl Overlay {
         if mode >= 2 || status.friend_tags.is_empty() {
             return;
         }
-        let Some((m, fov)) = read_camera() else { return };
+        let Some(cam) = read_camera() else { return };
         let [w, h] = ui.io().display_size;
         if w < 1.0 || h < 1.0 {
             return;
@@ -520,7 +1488,7 @@ impl Overlay {
         // marker that points the same way is stacked beside them instead of on top.
         let mut placed: Vec<[f32; 4]> = Vec::new();
         for tag in &status.friend_tags {
-            Self::draw_tag(ui, status, tag, mode, &m, fov, [w, h], &mut placed);
+            Self::draw_tag(ui, status, tag, mode, &cam.rows, cam.fov, [w, h], &mut placed);
         }
     }
 
@@ -630,13 +1598,16 @@ impl ImguiRenderLoop for Overlay {
     /// not known whether the game shows its own cursor in the System menu; if it does, this
     /// draws a second one).
     fn before_render<'a>(&'a mut self, ctx: &mut Context, _rc: &'a mut dyn RenderContext) {
-        ctx.io_mut().mouse_draw_cursor = PANEL_VISIBLE.load(Ordering::Relaxed);
+        ctx.io_mut().mouse_draw_cursor =
+            PANEL_VISIBLE.load(Ordering::Relaxed) || (crate::itemdrop::panel_visible() && !is_pad_mode());
     }
 
-    /// Mouse messages are kept from the game only while the panel is up and the pointer is
-    /// over it (`want_capture_mouse`); the keyboard is never filtered.
+    /// Suppress all game window input while the modal Drop Item dialog is open (plus soak),
+    /// and suppress game mouse events while the cursor hovers an open side drawer.
     fn message_filter(&self, io: &Io) -> MessageFilter {
-        if PANEL_VISIBLE.load(Ordering::Relaxed) && io.want_capture_mouse {
+        if crate::inputblock::blocked() {
+            MessageFilter::InputAll
+        } else if (PANEL_VISIBLE.load(Ordering::Relaxed) || crate::itemdrop::panel_visible()) && io.want_capture_mouse {
             MessageFilter::InputMouse
         } else {
             MessageFilter::empty()
@@ -644,6 +1615,15 @@ impl ImguiRenderLoop for Overlay {
     }
 
     fn render(&mut self, ui: &mut Ui) {
+        let focused = crate::spectate_input::game_focused();
+        let pad = if focused { crate::spectate_input::pad_state() } else { None };
+        let pad_active = pad_has_activity(pad);
+        let kbm_active = focused && kbm_has_activity(ui);
+        INPUT_IS_PAD.store(
+            detect_input_mode(INPUT_IS_PAD.load(Ordering::Relaxed), pad_active, kbm_active),
+            Ordering::Relaxed,
+        );
+
         // Debug hotkeys (settings: debug_hotkeys = 1).
         if tuning::debug_hotkeys() {
             if ui.is_key_pressed_no_repeat(Key::F8) {
@@ -661,12 +1641,24 @@ impl ImguiRenderLoop for Overlay {
             .ok()
             .and_then(|s| s.as_ref().map(|s| s.status.clone()))
             .unwrap_or_default();
+        let drop_snap = crate::itemdrop::ui_snapshot();
+        let [dw, dh] = ui.io().display_size;
+        let show_hud = hud_visible();
+        crate::depth::begin_overlay_frame(
+            dw,
+            dh,
+            show_hud && drop_snap.connected && !drop_snap.markers.is_empty(),
+        );
 
-        self.draw_tags(ui, &status);
-        draw_lock_mark(ui);
-        self.draw_party(ui, &status);
+        if show_hud {
+            self.draw_tags(ui, &status);
+            draw_lock_mark(ui);
+            self.draw_party(ui, &status);
+            self.draw_item_drops(ui, &drop_snap);
+        }
         self.draw_page_hint(ui);
         self.panel.draw(ui);
+        self.drop_panel.draw(ui, &drop_snap, pad);
 
         if !settings::show_status_overlay() {
             return;
@@ -694,7 +1686,10 @@ pub fn install(hmodule: usize) {
         .build()
         .apply();
     match result {
-        Ok(()) => log::line("ui: overlay installed"),
+        Ok(()) => {
+            log::line("ui: overlay installed");
+            crate::depth::install();
+        }
         Err(e) => log::line(&format!("ui: overlay failed: {e:?}")),
     }
 }
@@ -889,6 +1884,17 @@ fn edge_stack(p: [f32; 2], half: [f32; 2], vertical: bool, placed: &[[f32; 4]]) 
 mod tests {
     use super::*;
 
+    #[test]
+    fn world_hud_hides_behind_menus_cutscenes_warps_and_loads() {
+        assert!(should_show_world_hud(true, false, Some(0), false));
+        assert!(!should_show_world_hud(false, false, Some(0), false));
+        assert!(!should_show_world_hud(true, true, Some(0), false));
+        assert!(!should_show_world_hud(true, false, Some(0x40), false));
+        assert!(!should_show_world_hud(true, false, Some(0x08), false));
+        assert!(!should_show_world_hud(true, false, None, false));
+        assert!(!should_show_world_hud(true, false, Some(0), true));
+    }
+
     fn names(v: &[(u8, &str)]) -> Vec<(PeerId, String)> {
         v.iter().map(|(s, n)| (PeerId(*s), n.to_string())).collect()
     }
@@ -931,5 +1937,35 @@ mod tests {
         assert_eq!(edge_stack([70.0, 600.0], half, true, &placed), [70.0, 600.0]);
         // Top edge: sideways.
         assert_eq!(edge_stack([first[0] + 10.0, 300.0], half, false, &placed[..1]), [first[0] + 10.0 + 104.0, 300.0]);
+    }
+
+    #[test]
+    fn detect_input_mode_switches_cleanly_between_pad_and_kbm() {
+        // Starts KBM -> stays KBM when idle -> switches on clear pad input -> back on clear KBM.
+        assert!(!detect_input_mode(false, false, false));
+        assert!(detect_input_mode(false, true, false));
+        assert!(detect_input_mode(true, false, false));
+        assert!(!detect_input_mode(true, false, true));
+        // Simultaneous activity keeps previous mode stable.
+        assert!(detect_input_mode(true, true, true));
+        assert!(!detect_input_mode(false, true, true));
+    }
+
+    #[test]
+    fn dialog_pad_nav_handles_dpad_and_both_sticks_with_repeat() {
+        use crate::spectate_input::PadState;
+        let mut nav = DialogPadNav::default();
+        assert_eq!(nav.step(None, 0), 0);
+        // D-pad right edge -> +1, then delay until 350 ms
+        assert_eq!(nav.step(Some(PadState { buttons: PAD_DPAD_RIGHT, ..Default::default() }), 0), 1);
+        assert_eq!(nav.step(Some(PadState { buttons: PAD_DPAD_RIGHT, ..Default::default() }), 349), 0);
+        assert_eq!(nav.step(Some(PadState { buttons: PAD_DPAD_RIGHT, ..Default::default() }), 350), 1);
+        // Neutral resets
+        assert_eq!(nav.step(Some(PadState::default()), 360), 0);
+        // Left stick up -> +5
+        assert_eq!(nav.step(Some(PadState { ly: 22_000, ..Default::default() }), 370), 5);
+        // Release, then Right stick down -> -5
+        assert_eq!(nav.step(Some(PadState::default()), 380), 0);
+        assert_eq!(nav.step(Some(PadState { ry: -22_000, ..Default::default() }), 390), -5);
     }
 }

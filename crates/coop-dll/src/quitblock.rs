@@ -139,17 +139,17 @@ fn tramp(slot: &AtomicUsize) -> usize {
 }
 
 fn in_session(link: Link) -> bool {
-    matches!(link, Link::HostConnected | Link::ClientConnected)
+    matches!(link, Link::Hosting | Link::Searching | Link::HostConnected | Link::ClientConnected)
 }
 
 /// The decision, kept pure for the tests: block only a pause-menu request (armed) while
-/// a companion is connected, the option is on and the mod runs.
+/// a lobby is open, searching, or connected, the option is on and the mod runs.
 pub fn should_block(enabled: bool, mod_alive: bool, link: Link, armed_at_ms: u64, now_ms: u64) -> bool {
     enabled && mod_alive && in_session(link) && armed_at_ms != 0 && now_ms.saturating_sub(armed_at_ms) <= ARM_FOR_MS
 }
 
 /// Grey the Quit Game item out (and relabel it): the option is on, the mod runs and a
-/// companion is connected.
+/// lobby is open, searching, or connected.
 pub fn should_grey(enabled: bool, mod_alive: bool, link: Link) -> bool {
     enabled && mod_alive && in_session(link)
 }
@@ -179,14 +179,14 @@ fn quit_label(original: Option<&str>) -> String {
 /// `0x140C63670`: the default "disabled" predicate (originally always false).
 extern "C" fn pred_detour(this: usize) -> bool {
     // v8.31a: the Quit Game command exists only in the System list (OptionTop), so a call
-    // for it means that list is being drawn. Stamp the time for the 'Mod settings' panel
-    // (menu.rs); the return value below is unchanged. Off with `ingame_menu = 0`.
-    let menu_on = crate::tuning::ingame_menu();
+    // for it means that list is being drawn. Stamp the time for the 'Mod settings' / 'Drop Item'
+    // panels (menu.rs, itemdrop.rs); the return value below is unchanged when `grey` is false.
+    let track_list = crate::tuning::ingame_menu();
     let grey = grey_now();
-    if (!grey && !menu_on) || !is_quit_command(this, game::module_base(), read_ptr) {
+    if (!grey && !track_list) || !is_quit_command(this, game::module_base(), read_ptr) {
         return false;
     }
-    if menu_on {
+    if track_list {
         SYSTEM_LIST_MS.store(game::now_ms(), Ordering::Relaxed);
     }
     if !grey {
@@ -369,12 +369,11 @@ mod tests {
     #[test]
     fn blocks_only_an_armed_pause_menu_quit_while_connected() {
         let now = 1_000_000;
-        assert!(should_block(true, true, Link::ClientConnected, now - 5_000, now));
-        assert!(should_block(true, true, Link::HostConnected, now, now));
-        // Not in a session: hosting with nobody there, searching, off.
-        for l in [Link::Off, Link::Hosting, Link::Searching] {
-            assert!(!should_block(true, true, l, now, now));
+        for l in [Link::Hosting, Link::Searching, Link::HostConnected, Link::ClientConnected] {
+            assert!(should_block(true, true, l, now - 5_000, now));
         }
+        // Only when completely offline is Quit Game unblocked.
+        assert!(!should_block(true, true, Link::Off, now, now));
         // The game's own returns are never armed; an old arm expires.
         assert!(!should_block(true, true, Link::ClientConnected, 0, now));
         assert!(!should_block(true, true, Link::ClientConnected, now - ARM_FOR_MS - 1, now));
@@ -385,11 +384,10 @@ mod tests {
 
     #[test]
     fn greys_only_while_connected_with_the_option_on() {
-        assert!(should_grey(true, true, Link::HostConnected));
-        assert!(should_grey(true, true, Link::ClientConnected));
-        for l in [Link::Off, Link::Hosting, Link::Searching] {
-            assert!(!should_grey(true, true, l));
+        for l in [Link::Hosting, Link::Searching, Link::HostConnected, Link::ClientConnected] {
+            assert!(should_grey(true, true, l));
         }
+        assert!(!should_grey(true, true, Link::Off));
         assert!(!should_grey(false, true, Link::ClientConnected));
         assert!(!should_grey(true, false, Link::ClientConnected));
     }

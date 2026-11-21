@@ -94,13 +94,32 @@ fn is_reconnect_resume(had_epoch: bool, prev_done: bool, same_session: bool, gap
     had_epoch && prev_done && same_session && gap.is_some_and(|g| g < RECONNECT_RESUME)
 }
 
+/// Block that owns `idol`, matched by Sekiro map prefix (`idol / 1000`) against `IDOL_BY_BLOCK`.
+pub(crate) fn block_of_idol(idol: i32) -> Option<i32> {
+    if idol <= 0 {
+        return None;
+    }
+    IDOL_BY_BLOCK.iter().find(|&&(_, table)| table / 1000 == idol / 1000).map(|&(block, _)| block)
+}
+
+/// Chooses `(idol, target_block)` for joining or following the host.
+/// Prefers `host_idol` (the host's most recent Idol) when valid, falling back to `host_block`'s table Idol.
+pub(crate) fn choose_join_idol(host_idol: i32, host_block: i32) -> Option<(i32, i32)> {
+    if host_idol > 0
+        && let Some(idol_block) = block_of_idol(host_idol)
+    {
+        return Some((host_idol, idol_block));
+    }
+    IDOL_BY_BLOCK.iter().find(|&&(b, _)| b == host_block).map(|&(b, table)| (table, b))
+}
+
 #[derive(Default)]
 enum State {
     #[default]
     Idle,
-    Warping { since: Instant, target_block: i32 },
-    /// Resting at the arrival idol (join rest), then the teleport.
-    Resting { since: Instant, target_block: i32 },
+    Warping { since: Instant, target_block: i32, warped_idol: i32 },
+    /// Resting at the arrival idol (join rest), then optional menu teleport.
+    Resting { since: Instant, target_block: i32, warped_idol: i32 },
     Done,
 }
 
@@ -138,6 +157,8 @@ pub struct Join {
     last_frame_at: Option<Instant>,
     /// net.rs `session_gen` at that frame.
     last_frame_gen: u64,
+    /// Only true for an explicit menu "Go to friend" action; normal joins/follows stay at the idol.
+    teleport_on_arrival: bool,
     /// Since when the friend is in another block (the post-boss follow's grace).
     apart_since: Option<Instant>,
 }
@@ -146,6 +167,7 @@ impl Join {
     /// Menu: go to the friend now (idol warp of their block + teleport), no join rest.
     pub fn go_to_friend(&mut self) {
         self.rest_on_arrival = false;
+        self.teleport_on_arrival = true;
         self.follow_pending = None;
         self.state = State::Idle;
         self.warp_wait.reset();
@@ -304,80 +326,93 @@ impl Join {
                 // world (enemies alive, AI reset), so both start from the same
                 // state; a bare teleport kept the joiner's old world (desync).
                 let reload = crate::tuning::join_reload();
-                if here == Some(host.block) && !reload {
+                let h = HOST_IDOL.load(std::sync::atomic::Ordering::Relaxed);
+                if self.teleport_on_arrival && here == Some(host.block) && !reload {
                     teleport_next_to(player, host);
+                    self.teleport_on_arrival = false;
                     self.last_move = Some(Instant::now());
                     self.other_block_since = None;
                     self.state = State::Done;
-                } else if let Some(idol) = IDOL_BY_BLOCK.iter().find(|(b, _)| *b == host.block).map(|&(_, table)| {
-                    // The host's own last idol when it is in the same map as the table's
-                    // idol (same first four digits, e.g. 1101950 temple / 1101952 outskirts).
-                    let h = HOST_IDOL.load(std::sync::atomic::Ordering::Relaxed);
-                    if h > 0 && h / 1000 == table / 1000 { h } else { table }
-                }) {
+                } else if let Some((idol, target_block)) = if self.teleport_on_arrival {
+                    IDOL_BY_BLOCK.iter().find(|&&(b, _)| b == host.block).map(|&(b, table)| {
+                        let id = if h > 0 && h / 1000 == table / 1000 { h } else { table };
+                        (id, b)
+                    })
+                } else {
+                    choose_join_idol(h, host.block)
+                } {
                     // Live crash 2026-10-23: a warp under an open talk menu freed the
                     // menu's context. The gate waits for a quiet moment (up to 20 s).
                     match self.warp_wait.poll(in_world_for) {
                         WarpGate::Wait => {}
-                        WarpGate::GaveUp => self.state = State::Done,
+                        WarpGate::GaveUp => {
+                            self.teleport_on_arrival = false;
+                            self.state = State::Done;
+                        }
                         WarpGate::Go => {
                             log::line(&format!(
-                                "join: host is in block {} (we are in {here:?}), warping to idol {idol}",
+                                "join: host is in block {} (host idol {h}, we are in {here:?}), warping to idol {idol} (block {target_block})",
                                 host.block
                             ));
                             game::warp_to_idol(idol);
                             warped = true;
                             self.last_move = Some(Instant::now());
-                            self.state = State::Warping { since: Instant::now(), target_block: host.block };
+                            self.state = State::Warping { since: Instant::now(), target_block, warped_idol: idol };
                             self.saw_loading = false;
                             self.warp_from_block = here.unwrap_or(-1);
                         }
                     }
                 } else {
                     log::line(&format!("join: no idol known for host block {}, walk there yourself", host.block));
+                    self.teleport_on_arrival = false;
                     self.state = State::Done;
                 }
             }
-            State::Warping { since, target_block } => {
+            State::Warping { since, target_block, warped_idol } => {
                 if here == Some(target_block) {
-                    // The loading screen is over: put us next to the host.
-                    // Same-block warps keep the block index: wait for the load.
+                    // The loading screen is over; rest at the warped idol or finish staying there
+                    // (only explicit menu "Go to friend" teleports next to the host).
                     if (self.saw_loading || target_block != self.warp_from_block) && in_world_for >= TELEPORT_AFTER_LOAD {
-                        // The host may have left the block during our load: its
-                        // coordinates belong to another map then, and writing
-                        // them here dropped us into the void. Stay at the idol;
-                        // the other-block rule follows them if it was a warp.
-                        if host.block != target_block {
+                        if self.teleport_on_arrival && host.block != target_block {
                             log::line(&format!("join: host moved on to block {} during our load, staying at the idol", host.block));
+                            self.teleport_on_arrival = false;
                             self.state = State::Done;
-                        } else if let Some(&(_, idol)) =
-                            IDOL_BY_BLOCK.iter().find(|(b, _)| *b == target_block).filter(|_| crate::tuning::join_rest() && std::mem::take(&mut self.rest_on_arrival))
-                        {
+                        } else if crate::tuning::join_rest() && std::mem::take(&mut self.rest_on_arrival) {
                             // Rest first: our own save's dead enemies come back (the host's
-                            // HP mirror kills the ones that are dead there), then follow.
-                            log::line(&format!("join: resting at idol {idol} before going to the host"));
-                            self.rest_request = Some(idol);
-                            self.state = State::Resting { since: Instant::now(), target_block };
+                            // HP mirror kills the ones that are dead there).
+                            log::line(&format!("join: resting at idol {warped_idol} on arrival"));
+                            self.rest_request = Some(warped_idol);
+                            self.state = State::Resting { since: Instant::now(), target_block, warped_idol };
                         } else {
-                            teleport_next_to(player, host);
+                            if std::mem::take(&mut self.teleport_on_arrival) {
+                                teleport_next_to(player, host);
+                            } else {
+                                log::line(&format!("join: arrived at host idol {warped_idol}, staying at the idol"));
+                            }
                             self.state = State::Done;
                         }
                     }
                 } else if since.elapsed().as_secs() > WARP_TIMEOUT_SECS {
                     log::line("join: warp did not arrive in time, giving up");
+                    self.teleport_on_arrival = false;
                     self.state = State::Done;
                 }
             }
-            State::Resting { since, target_block } => {
+            State::Resting { since, target_block, warped_idol } => {
                 if since.elapsed() >= REST_WAIT && in_world_for >= Duration::from_secs(2) {
-                    if here == Some(target_block) && host.block == target_block {
-                        teleport_next_to(player, host);
+                    if std::mem::take(&mut self.teleport_on_arrival) {
+                        if here == Some(target_block) && host.block == target_block {
+                            teleport_next_to(player, host);
+                        } else {
+                            log::line("join: after the rest we or the host are in another block, staying at the idol");
+                        }
                     } else {
-                        log::line("join: after the rest we or the host are in another block, staying at the idol");
+                        log::line(&format!("join: rested at host idol {warped_idol}, staying at the idol"));
                     }
                     self.last_move = Some(Instant::now());
                     self.state = State::Done;
                 } else if since.elapsed().as_secs() > WARP_TIMEOUT_SECS {
+                    self.teleport_on_arrival = false;
                     self.state = State::Done;
                 }
             }
@@ -445,5 +480,21 @@ mod tests {
         assert_eq!(boss_window_secs(1_000, 9_500), Some(8));
         assert_eq!(boss_window_secs(1_000, 61_000), Some(60));
         assert_eq!(boss_window_secs(1_000, 61_001), None);
+    }
+
+    #[test]
+    fn block_of_idol_and_choose_join_idol_prefer_host_idol() {
+        let (b0, t0) = IDOL_BY_BLOCK[0];
+        let same_map_idol = (t0 / 1000) * 1000 + 999;
+        assert_eq!(block_of_idol(0), None);
+        assert_eq!(block_of_idol(-1), None);
+        assert_eq!(block_of_idol(t0), Some(b0));
+        assert_eq!(block_of_idol(same_map_idol), Some(b0));
+        assert_eq!(block_of_idol(1_101_952), block_of_idol(1_101_950));
+        assert_eq!(choose_join_idol(same_map_idol, 9999), Some((same_map_idol, b0)));
+        assert_eq!(choose_join_idol(-1, b0), Some((t0, b0)));
+        assert_eq!(choose_join_idol(0, b0), Some((t0, b0)));
+        assert_eq!(choose_join_idol(9_999_999, b0), Some((t0, b0)));
+        assert_eq!(choose_join_idol(-1, 9999), None);
     }
 }

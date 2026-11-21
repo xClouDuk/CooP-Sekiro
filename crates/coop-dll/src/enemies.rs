@@ -66,7 +66,7 @@ const OWN_COMBAT_FOR: Duration = Duration::from_millis(2500);
 /// matters more than a high one).
 const NETAI_EVERY: Duration = Duration::from_millis(40);
 /// Enemies this close to either player get movement every tick ...
-const NETAI_NEAR_M: f32 = 30.0;
+const NETAI_NEAR_M: f32 = 65.0;
 /// ... the rest (up to SYNC_RADIUS_M) every 4th (~6 Hz).
 const NETAI_FAR_EVERY: u32 = 4;
 /// A changed behavior/action record is sent this many times in a row under
@@ -911,6 +911,7 @@ impl Enemies {
             // livesync then took that life back on the host). Persist/posture §35.
             let fresh_here = max_hp.is_some_and(|m| m > 0 && local >= m);
             let rest_hold = local > 0 && (s.hp <= 0 || (fresh_here && s.hp < local)) && crate::restsync::hold_kills();
+            let wipe_hold = local > 0 && (s.hp <= 0 || (fresh_here && s.hp < local)) && crate::persist::wipe_active();
             if rest_hold && self.rest_held.insert(id) && self.rest_logs < 10 {
                 self.rest_logs += 1;
                 log::line(&format!(
@@ -921,7 +922,7 @@ impl Enemies {
             // v8.60: a Puppeteer puppet here is our own fighter; the host's copy of that enemy
             // is a corpse. Held like a rest-held enemy: no host HP (0 killed it), its own AI,
             // no position from the host (puppetguard.rs covers the native session's type 5).
-            let rest_hold = rest_hold || crate::puppetguard::mode4_hold(chr.0, id, local, s.hp);
+            let rest_hold = rest_hold || wipe_hold || crate::puppetguard::mode4_hold(chr.0, id, local, s.hp);
             if corpse || rest_hold {
                 self.last_written_hp.insert(id, local);
             } else if !holding {
@@ -1400,11 +1401,17 @@ impl Facing {
 /// metres (horizontal) runs on our own AI (mode 4) / is claimed for us (native session),
 /// so its awareness is our machine's, as in single player. 0 = the old 5 m rear check.
 pub static STEALTH_WINDOW_M: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(15);
+/// Great Serpent character id (`c5010`: Ashina Outskirts palanquin & Sunken Valley cavern).
+pub const SERPENT_CHAR_ID: i32 = 5010;
 /// Plunging deathblow: at least this far above the enemy, at most `PLUNGE_MAX_ABOVE_M`.
 const PLUNGE_ABOVE_M: f32 = 2.0;
 const PLUNGE_MAX_ABOVE_M: f32 = 25.0;
+/// Sunken Valley Cavern beam sits higher above the Great Serpent's root than 25 m.
+pub const PLUNGE_MAX_ABOVE_M_SERPENT: f32 = 38.0;
 /// Plunge approaches count within at most this horizontal distance.
 const PLUNGE_MAX_HORIZ_M: f32 = 12.0;
+/// Ashina Outskirts palanquin eye-stab / scripted approach distance to the Great Serpent.
+pub const SERPENT_EVENT_CLAIM_M: f32 = 12.0;
 /// Once handed off, the enemy stays on our AI this long after the approach ended
 /// (a patrol turning round must not flap it between the two AIs).
 const STEALTH_LINGER: Duration = Duration::from_millis(3000);
@@ -1412,6 +1419,40 @@ const STEALTH_LINGER: Duration = Duration::from_millis(3000);
 const STEALTH_HOLD_EXTRA_M: f32 = 5.0;
 /// Native session: a claim is dropped this long after the approach ended.
 const CLAIM_LINGER: Duration = Duration::from_millis(3000);
+
+/// Untouched non-table miniboss (2+ lives, full HP, full posture, no active boss gauge).
+/// Allows joiners to claim local AI during stealth/plunge approach (e.g. 2nd General 1100301).
+pub fn unengaged_miniboss(
+    table_boss: bool,
+    is_gauge: bool,
+    lives0: i32,
+    lives: i32,
+    hp: i32,
+    max_hp: i32,
+    posture: i32,
+    max_posture: i32,
+) -> bool {
+    !table_boss
+        && !is_gauge
+        && lives0 >= 2
+        && lives >= lives0
+        && max_hp > 0
+        && hp >= max_hp
+        && (max_posture <= 0 || posture >= max_posture)
+}
+
+/// Player approaching the Great Serpent (`c5010`): close by (Ashina Outskirts palanquin)
+/// or plunging from the Sunken Valley beam (`2..38 m` above, `<= 18 m` horizontally).
+pub fn serpent_approach(pp: [f32; 3], ep: [f32; 3]) -> bool {
+    let dx = pp[0] - ep[0];
+    let dy = pp[1] - ep[1];
+    let dz = pp[2] - ep[2];
+    let horiz = (dx * dx + dz * dz).sqrt();
+    if horiz <= SERPENT_EVENT_CLAIM_M && dy.abs() <= SERPENT_EVENT_CLAIM_M {
+        return true;
+    }
+    (PLUNGE_ABOVE_M..=PLUNGE_MAX_ABOVE_M_SERPENT).contains(&dy) && horiz <= PLUNGE_MAX_HORIZ_M * 1.5
+}
 
 fn stealth_window_m() -> f32 {
     STEALTH_WINDOW_M.load(std::sync::atomic::Ordering::Relaxed).min(40) as f32
@@ -1448,6 +1489,18 @@ fn boss_handoff_allowed(is_boss: bool, reason: &str) -> bool {
 /// is missing from the bosses table and shows no gauge here (Headless, live 2026-10-27).
 fn boss_like_lives(chr: Chr) -> bool {
     crate::livesync::multi_life(crate::livesync::lives0_of(chr))
+}
+
+/// Reads whether `chr` is currently an untouched non-table miniboss eligible for stealth handoff.
+pub(crate) fn is_unengaged_miniboss_chr(chr: Chr, gauge: Option<i32>) -> bool {
+    let table_boss = chr.entity_id().is_some_and(|e| crate::bosses::encounter_of(e).is_some());
+    let is_gauge = gauge.is_some() && chr.entity_id() == gauge;
+    let lives0 = crate::livesync::lives0_of(chr);
+    let Some((data, hp, max_hp, max_posture, lives)) = crate::livesync::read_data(chr) else {
+        return false;
+    };
+    let posture = crate::livesync::read_posture(data).unwrap_or(max_posture);
+    unengaged_miniboss(table_boss, is_gauge, lives0, lives, hp, max_hp, posture, max_posture)
 }
 
 /// Another living player stands within `FIGHT_NEAR_M` of an enemy at `ep`: it is in a
@@ -1502,14 +1555,16 @@ impl Enemies {
             Some("node")
         } else if broken {
             Some("posture")
+        } else if chr.character_id() == Some(SERPENT_CHAR_ID) {
+            serpent_approach(pp, ep).then_some("serpent")
         } else {
-            // A boss (or an illusion of its encounter) never goes to the friend's own AI
-            // for a stealth / plunge approach: two separate bosses ran, 22 m apart (live
-            // 2026-10-26, 6 handoffs in 156 s). The native path has had this since v8.6.
+            // Table bosses and engaged minibosses never move onto the client's AI for stealth,
+            // while untouched open-world minibosses (e.g. 2nd General) can be stealth/plunge approached.
+            let gauge = game::boss_state().map(|b| b.entity);
             let is_boss = approach.is_some()
                 && (crate::bosses::encounter_of(id).is_some()
-                    || game::boss_state().is_some_and(|b| b.entity == id)
-                    || boss_like_lives(chr));
+                    || gauge == Some(id)
+                    || (boss_like_lives(chr) && !is_unengaged_miniboss_chr(chr, gauge)));
             approach.map(|(r, _)| r).filter(|r| boss_handoff_allowed(is_boss, r))
         };
         let old_rule = stealth_window_m() <= 0.0;
@@ -1574,7 +1629,7 @@ impl Enemies {
         let near: Vec<(i32, Chr)> = self
             .known
             .iter()
-            .filter(|(_, c)| c.position().is_some_and(|p| game::distance(pp, p) <= reach + PLUNGE_MAX_ABOVE_M))
+            .filter(|(_, c)| c.position().is_some_and(|p| game::distance(pp, p) <= reach + PLUNGE_MAX_ABOVE_M_SERPENT))
             .copied()
             .collect();
         let mut changed = false;
@@ -1583,25 +1638,34 @@ impl Enemies {
             if chr.hp().is_none_or(|hp| hp <= 0) {
                 continue;
             }
-            // Never a boss (v8.6): the claim moved Genichiro to the friend's AI while the
-            // host still ran it ("claimed by both machines" for 21 s, live 2026-10-25), so
-            // two AIs drove it and it jumped between the players. Bosses take no stealth
-            // deathblow in a fight anyway.
-            // v8.49: nor a miniboss (two or more lives): Headless 1700500 was claimed "behind"
-            // while the friend fought it, and both machines ran it (live 2026-10-27).
-            if gauge == Some(id) || crate::bosses::encounter_of(id).is_some() || boss_like_lives(chr) {
+            let Some(net_id) = netai::net_id(chr) else { continue };
+            // Never claim an enemy while another player holds an active deathblow lock on it.
+            if crate::nsession::dblock::peer_locked(net_id) {
                 continue;
             }
-            // Nor one another living player is fighting (v8.8, 20 m since v8.10): the claim handed an enemy
-            // fighting the host to our AI, which knew nothing of the fight, so it "forgot"
-            // the players and gave a stealth deathblow (live 2026-10-25). An unaware enemy
-            // nobody stands next to is still ours to sneak up on.
-            if chr.position().is_some_and(|ep| fought_by_another(ep, others)) {
+            let Some(ep) = chr.position() else { continue };
+            let is_serpent = chr.character_id() == Some(SERPENT_CHAR_ID);
+            if !is_serpent {
+                // Main table bosses and already-engaged / damaged minibosses stay off stealth
+                // claims; untouched open-world minibosses (e.g. 2nd General 1100301) are allowed
+                // so joiners can perform the opening stealth/plunge deathblow.
+                let boss_blocked = gauge == Some(id)
+                    || crate::bosses::encounter_of(id).is_some()
+                    || (boss_like_lives(chr) && !is_unengaged_miniboss_chr(chr, gauge));
+                if boss_blocked {
+                    continue;
+                }
+            }
+            if fought_by_another(ep, others) {
                 continue;
             }
             let holding = self.claims.contains_key(&id);
-            let Some((why, dy)) = self.stealth_approach(chr, player, holding) else { continue };
-            let Some(net_id) = netai::net_id(chr) else { continue };
+            let approach = if is_serpent {
+                serpent_approach(pp, ep).then_some(("serpent", pp[1] - ep[1]))
+            } else {
+                self.stealth_approach(chr, player, holding)
+            };
+            let Some((why, dy)) = approach else { continue };
             match self.claims.get_mut(&id) {
                 Some(c) => c.1 = now,
                 None => {
@@ -1693,8 +1757,8 @@ impl Enemies {
     /// gives our own drops / sen once ("died without our kill"); otherwise it is marked
     /// no-loot. True = it was alive.
     pub fn force_dead_one(&self, id: i32, loot: bool) -> bool {
-        // v8.25c: a kill order within 90 s of a wipe is from the old world (no kill, no loot).
-        if crate::persist::wipe_recent(crate::persist::WIPE_STALE) {
+        // v8.25c: a kill order while a wipe is settling is from the old world (no kill, no loot).
+        if crate::persist::wipe_active() {
             return false;
         }
         let force_dead: extern "C" fn(u32, u8) = unsafe { std::mem::transmute(game::module_base() + 0x751F20) };
@@ -1891,5 +1955,28 @@ mod tests {
         assert_eq!(approach_kind([0.0, 0.0, -4.0], f, 0.0, false), Some("behind"));
         assert_eq!(approach_kind([0.0, 0.0, -6.0], f, 0.0, false), None);
         assert_eq!(approach_kind([0.0, 3.0, 2.0], f, 0.0, false), None);
+    }
+
+    #[test]
+    fn unengaged_miniboss_allows_untouched_blocks_engaged_and_table_bosses() {
+        assert!(unengaged_miniboss(false, false, 2, 2, 1000, 1000, 500, 500));
+        assert!(!unengaged_miniboss(true, false, 2, 2, 1000, 1000, 500, 500), "table boss");
+        assert!(!unengaged_miniboss(false, true, 2, 2, 1000, 1000, 500, 500), "boss gauge shown");
+        assert!(!unengaged_miniboss(false, false, 2, 1, 1000, 1000, 500, 500), "lost a life");
+        assert!(!unengaged_miniboss(false, false, 2, 2, 999, 1000, 500, 500), "damaged HP");
+        assert!(!unengaged_miniboss(false, false, 2, 2, 1000, 1000, 490, 500), "damaged posture");
+        assert!(!unengaged_miniboss(false, false, 1, 1, 500, 500, 200, 200), "normal 1-life enemy");
+    }
+
+    #[test]
+    fn serpent_approach_covers_palanquin_and_cavern_plunge() {
+        let ep = [0.0, 0.0, 0.0];
+        // Close eye-stab (palanquin)
+        assert!(serpent_approach([6.0, 1.5, 4.0], ep));
+        assert!(!serpent_approach([15.0, 0.0, 0.0], ep));
+        // Sunken Valley wooden beam plunge (up to 38 m above)
+        assert!(serpent_approach([5.0, 34.0, 5.0], ep));
+        assert!(!serpent_approach([5.0, 40.0, 5.0], ep));
+        assert!(!serpent_approach([25.0, 34.0, 0.0], ep));
     }
 }

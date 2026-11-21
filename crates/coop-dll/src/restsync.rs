@@ -55,6 +55,10 @@ pub enum Kind {
     Direct,
     /// Resync (resync.rs) through the mailboxes.
     Resync,
+    /// Full party wipe: direct AllChrRespawn reset while alive.
+    Wipe,
+    /// Full party wipe: world reloaded after all players died.
+    WipeReload,
 }
 
 impl Kind {
@@ -64,6 +68,8 @@ impl Kind {
             Kind::Mirrored => "mirrored (idol mailbox)",
             Kind::Direct => "mirrored (direct AllChrRespawn)",
             Kind::Resync => "resync",
+            Kind::Wipe => "party wipe (AllChrRespawn)",
+            Kind::WipeReload => "party wipe reload",
         }
     }
     /// A mailbox rest may do nothing (idol object not loaded / not updated): fall back.
@@ -85,6 +91,7 @@ struct Verify {
 struct State {
     generation: u64,
     seen_generation: u64,
+    last_kind: Option<Kind>,
     at: Option<Instant>,
     /// Start of the client's no-kill window (cleared by a load).
     hold_from: Option<Instant>,
@@ -106,6 +113,7 @@ pub fn note(kind: Kind, idol: i32) {
     let now = Instant::now();
     with(|s| {
         s.generation += 1;
+        s.last_kind = Some(kind);
         s.at = Some(now);
         s.hold_from = Some(now);
         s.verify = Some(Verify { kind, idol, since: now, dead_before: None, saw_state: false, fell_back: false });
@@ -113,6 +121,43 @@ pub fn note(kind: Kind, idol: i32) {
     log::line(&format!(
         "rest: {} rest at idol {idol}: enemies reset here; for {} s the friend's dead enemies are not forced on ours",
         kind.label(),
+        HOLD_KILLS_FOR.as_secs()
+    ));
+}
+
+/// Full party wipe while already alive (after `world::respawn_all()`): notifies enemy sync and
+/// opens a no-kill hold window so late pre-wipe dead lists do not kill respawned enemies.
+pub fn note_wipe(idol: i32, why: &str) {
+    crate::invguard::checkpoint(&format!("before party wipe ({why}) at idol {idol}"));
+    crate::invguard::note_rest();
+    let now = Instant::now();
+    with(|s| {
+        s.generation += 1;
+        s.last_kind = Some(Kind::Wipe);
+        s.at = Some(now);
+        s.hold_from = Some(now);
+        s.verify = Some(Verify { kind: Kind::Wipe, idol, since: now, dead_before: None, saw_state: false, fell_back: false });
+    });
+    log::line(&format!(
+        "rest: party wipe ({why}) at idol {idol}: enemies reset here; holding dead-list kills for {} s",
+        HOLD_KILLS_FOR.as_secs()
+    ));
+}
+
+/// Full party wipe finished reloading into a fresh world: notifies enemy/session tracking and
+/// holds dead-list kills for `HOLD_KILLS_FOR` without scheduling another `Verify` respawn check.
+pub fn note_wipe_reload() {
+    crate::invguard::note_rest();
+    let now = Instant::now();
+    with(|s| {
+        s.generation += 1;
+        s.last_kind = Some(Kind::WipeReload);
+        s.at = Some(now);
+        s.hold_from = Some(now);
+        s.verify = None;
+    });
+    log::line(&format!(
+        "rest: party wipe reload completed: clearing enemy state and holding dead-list kills for {} s",
         HOLD_KILLS_FOR.as_secs()
     ));
 }
@@ -154,7 +199,7 @@ pub fn tick(enemies: &mut Enemies, peers: &PeerSet) {
     let Some((new_rest, kind)) = with(|s| {
         let fresh = s.generation != s.seen_generation;
         s.seen_generation = s.generation;
-        (fresh, s.verify.as_ref().map(|v| v.kind))
+        (fresh, s.last_kind)
     }) else {
         return;
     };

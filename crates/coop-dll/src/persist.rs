@@ -152,6 +152,71 @@ fn observed(hp: i32, max_hp: i32, lives: i32, lives0: i32, getting_up: bool) -> 
     BossRec { hp: if getting_up { max_hp.max(hp) } else { hp }, max_hp, lives, lives0 }
 }
 
+/// We died and every connected peer is dead (`our_dead` = committed death or spectating;
+/// `peers_dead` = each peer committed `EV_DEATH` or `EV_DOWN(1)`). Never true solo or while any
+/// player is still alive / deciding a Resurrect.
+pub fn wipe_participants_dead(our_dead: bool, peers_dead: &[bool]) -> bool {
+    our_dead && !peers_dead.is_empty() && peers_dead.iter().all(|&d| d)
+}
+
+/// Minimum drain window after a wipe so in-flight pre-wipe packets cannot resurrect stale state.
+const WIPE_MIN_HOLD: Duration = Duration::from_secs(6);
+/// Grace after every participant (us and all tracked peers) has finished its post-wipe reload.
+const WIPE_SETTLE_AFTER_ALL_LOAD: Duration = Duration::from_secs(3);
+/// Upper safety cap on the wipe guard if a peer's reload timestamp is missed.
+const WIPE_MAX_HOLD: Duration = Duration::from_secs(45);
+/// Deduplication window when `EV_WIPE` arrives right after a local wipe clear.
+const WIPE_LOCAL_DEDUP: Duration = Duration::from_secs(5);
+
+/// Smart post-wipe guard window: active from the wipe moment through everyone's reload + settle,
+/// clamped to `[WIPE_MIN_HOLD, WIPE_MAX_HOLD]` so Attempt #2 starts syncing promptly after reload.
+#[derive(Clone, Debug)]
+struct WipeWindow {
+    at: Instant,
+    our_reloaded: bool,
+    tracked_peers: BTreeSet<PeerId>,
+    all_reloaded_at: Option<Instant>,
+}
+
+impl WipeWindow {
+    fn new(now: Instant, our_reloaded: bool, peers: &[PeerId]) -> Self {
+        Self {
+            at: now,
+            our_reloaded,
+            tracked_peers: peers.iter().copied().collect(),
+            all_reloaded_at: None,
+        }
+    }
+
+    fn update(&mut self, now: Instant, our_reloaded: bool, peer_loaded: &[(PeerId, Option<Instant>)]) {
+        self.our_reloaded |= our_reloaded;
+        self.tracked_peers.retain(|id| peer_loaded.iter().any(|(pid, _)| pid == id));
+        if self.our_reloaded
+            && self
+                .tracked_peers
+                .iter()
+                .all(|id| peer_loaded.iter().any(|(pid, loaded)| pid == id && loaded.is_some_and(|t| t > self.at)))
+        {
+            self.all_reloaded_at.get_or_insert(now);
+        }
+    }
+
+    fn active(&self, now: Instant, max_window: Duration) -> bool {
+        let elapsed = now.saturating_duration_since(self.at);
+        if elapsed >= max_window.min(WIPE_MAX_HOLD) {
+            return false;
+        }
+        if elapsed < WIPE_MIN_HOLD {
+            return true;
+        }
+        if let Some(done) = self.all_reloaded_at {
+            now.saturating_duration_since(done) < WIPE_SETTLE_AFTER_ALL_LOAD
+        } else {
+            true
+        }
+    }
+}
+
 /// Every player died within `WIPE_WINDOW` (`is_wipe`): the deaths (ours, then each
 /// peer's) to clear for, unless this very set was cleared already. A later death makes a
 /// new set, so a second wipe soon after a first one clears again (live 2026-10-24: the
@@ -299,6 +364,17 @@ struct State {
     /// A wipe cleared everything while we were dead: the world here is still the old one
     /// until our reload, so nothing is recorded, sent or taken from the peers until then.
     hold_load: bool,
+    /// Latched while `our_dead` && all peers are dead (including `EV_DOWN(1)` spectating) so a
+    /// long boss wipe clears once per wipe instead of every frame.
+    wipe_latched: bool,
+    /// True during the current load if `boss_step` restored a persisted boss record onto a fresh
+    /// boss (reset on every load).
+    restored_this_load: bool,
+    /// Timestamp of the last boss record restore onto a fresh copy (`boss_restored_recently`).
+    last_boss_restore_at: Option<Instant>,
+    /// Timestamp of the last wipe clear (`tick`, `note_wipe`, `note_wipe_loaded`, `note_wipe_remote`),
+    /// so deaths from an earlier attempt cannot combine with Attempt #2's first death.
+    wipe_floor: Option<Instant>,
     /// When a boss was last seen losing a life (its get-up HP is not a record), and the
     /// lives it had at our last sight (this load).
     life_lost_at: HashMap<i32, Instant>,
@@ -317,6 +393,7 @@ impl State {
     }
 
     fn clear(&mut self, why: &str) {
+        let now = Instant::now();
         let (d, r, b) = (self.dead.len(), self.rewarded.len(), self.bosses.len());
         self.dead.clear();
         self.rewarded.clear();
@@ -327,8 +404,18 @@ impl State {
         self.boss_checked.clear();
         self.life_lost_at.clear();
         self.last_lives.clear();
-        self.cleared_at = Some(Instant::now());
+        self.our_dead_at = None;
+        self.peer_dead_at.clear();
+        self.wipe_cleared = None;
+        self.wipe_latched = false;
+        self.wipe_floor = Some(now);
+        self.cleared_at = Some(now);
         log::line(&format!("persist: {why}: dead set ({d}), paid kills ({r}) and boss records ({b}) cleared"));
+    }
+
+    fn clear_wipe(&mut self, why: &str, now: Instant) {
+        self.clear(why);
+        self.wipe_floor = Some(now);
     }
 
     /// Right after a clear: the friend's messages are from before it, and our own world
@@ -368,47 +455,129 @@ pub fn mark_rewarded(id: i32) {
 
 /// A wipe seen elsewhere (bossrules.rs release "wipe").
 /// Both players reload now (the death screen), so the world stays frozen until ours.
-pub fn note_wipe(why: &str) {
-    mark_wipe();
+pub fn note_wipe(why: &str, peers: &PeerSet) {
+    let now = Instant::now();
     with(|s| {
         if !s.hold_load {
-            s.clear(&format!("wipe ({why})"));
+            s.clear_wipe(&format!("wipe ({why})"), now);
             s.hold_load = true;
         }
     });
+    let ids: Vec<PeerId> = peers.iter().map(|p| p.id).collect();
+    arm_wipe(now, false, &ids);
 }
 
 /// A wipe decided after we already reloaded (puppet.rs `death_sync`): the records go and the
-/// friend's late ones are ignored for `AFTER_REST_IGNORE` (`clear`), but nothing is held until the
-/// next load (that is `note_wipe`, for a wipe whose reload is still ahead of us).
-pub fn note_wipe_loaded(why: &str) {
-    with(|s| s.clear(&format!("wipe after our reload ({why})")));
+/// friend's late ones are ignored until every peer reloads + settles, without holding a load.
+pub fn note_wipe_loaded(why: &str, peers: &PeerSet) {
+    let now = Instant::now();
+    with(|s| s.clear_wipe(&format!("wipe after our reload ({why})"), now));
+    let ids: Vec<PeerId> = peers.iter().map(|p| p.id).collect();
+    arm_wipe(now, true, &ids);
 }
 
-/// For how long after a wipe the friend's dead lists, boss records, lives and loot are
-/// treated as the old world's (v8.25c). Without a wipe epoch on the packets (protocol bump,
-/// out of scope) this is a time window: a friend still in the old world for longer gets through.
+/// A wipe broadcast received from a peer (`EV_WIPE(0, _)`): clears persisted boss state on the
+/// last survivor even if their companion spectated for > 90 s or hadn't committed a death before.
+/// Returns `true` if a boss record had already been restored during the current load before `EV_WIPE` arrived.
+pub fn note_wipe_remote(why: &str, player_dead: bool, peers: &PeerSet) -> bool {
+    let now = Instant::now();
+    let res = with(|s| {
+        let already_deduped = s.wipe_floor.is_some_and(|t| now.saturating_duration_since(t) < WIPE_LOCAL_DEDUP);
+        let restored = std::mem::take(&mut s.restored_this_load);
+        if !already_deduped {
+            s.clear_wipe(&format!("wipe ({why})"), now);
+            if player_dead {
+                s.hold_load = true;
+            }
+        }
+        (!already_deduped, restored)
+    });
+    if let Some((armed_new, restored)) = res {
+        if armed_new {
+            let ids: Vec<PeerId> = peers.iter().map(|p| p.id).collect();
+            arm_wipe(now, !player_dead, &ids);
+        }
+        restored
+    } else {
+        false
+    }
+}
+
+/// Clears persisted HP/lives for one boss encounter (`entity` and all of its encounter members)
+/// when everyone fighting that boss wiped in a 3+ player session while someone elsewhere stayed alive.
+pub fn clear_boss_encounter(entity: i32, why: &str) {
+    if entity <= 0 {
+        return;
+    }
+    let targets: Vec<i32> = match crate::bosses::encounter_of(entity) {
+        Some(enc) => enc.entities.to_vec(),
+        None => vec![entity],
+    };
+    with(|s| {
+        let mut removed = 0usize;
+        for id in &targets {
+            if s.bosses.remove(id).is_some() {
+                removed += 1;
+            }
+            s.boss_checked.remove(id);
+            s.life_lost_at.remove(id);
+            s.last_lives.remove(id);
+            s.enc_first.remove(id);
+        }
+        if let Some(enc) = crate::bosses::encounter_of(entity)
+            && let Some(first) = enc.entities.first()
+        {
+            s.enc_first.remove(first);
+        }
+        s.out_bosses = false;
+        log::line(&format!("persist: {why}: cleared {removed} boss record(s) for {entity} ({targets:?})"));
+    });
+}
+
+/// Legacy constant kept for external call signatures; `WipeWindow` clamps the active guard
+/// dynamically once all participants reload (at most `WIPE_MAX_HOLD`).
 pub const WIPE_STALE: Duration = Duration::from_secs(90);
 
-/// When the last wipe was decided here (`note_wipe`, the tick's `wipe_deaths`); NOT `note_wipe_loaded`.
-static WIPE_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static WIPE_WIN: Mutex<Option<WipeWindow>> = Mutex::new(None);
 
-fn mark_wipe() {
-    if let Ok(mut g) = WIPE_AT.lock() {
-        *g = Some(Instant::now());
+fn arm_wipe(now: Instant, our_reloaded: bool, peer_ids: &[PeerId]) {
+    if let Ok(mut g) = WIPE_WIN.lock() {
+        *g = Some(WipeWindow::new(now, our_reloaded, peer_ids));
+    }
+}
+
+fn update_wipe_window(now: Instant, our_reloaded: bool, peer_loaded: &[(PeerId, Option<Instant>)]) {
+    if let Ok(mut g) = WIPE_WIN.lock()
+        && let Some(w) = g.as_mut()
+    {
+        w.update(now, our_reloaded, peer_loaded);
+        if !w.active(now, WIPE_MAX_HOLD) {
+            *g = None;
+        }
     }
 }
 
 /// `at` is within `within` of `now` (pure, for tests).
+#[cfg(test)]
 fn recent_at(at: Option<Instant>, now: Instant, within: Duration) -> bool {
     at.is_some_and(|t| now.saturating_duration_since(t) < within)
 }
 
-/// A wipe was decided less than `within` ago: whatever the friend sends about enemies may
-/// predate it (the world was reset), so dead lists / lives / loot from it are dropped.
+/// A wipe is still settling (participants still reloading / draining in-flight pre-wipe packets),
+/// bounded above by `within.min(WIPE_MAX_HOLD)`.
 pub fn wipe_recent(within: Duration) -> bool {
-    let at = WIPE_AT.lock().ok().and_then(|g| *g);
-    recent_at(at, Instant::now(), within)
+    let now = Instant::now();
+    WIPE_WIN.lock().ok().and_then(|g| g.as_ref().map(|w| w.active(now, within))).unwrap_or(false)
+}
+
+/// Smart post-wipe guard: true while waiting for everyone's reload + settle after a wipe.
+pub fn wipe_active() -> bool {
+    wipe_recent(WIPE_MAX_HOLD)
+}
+
+/// True if `boss_step` restored a persisted boss record onto a fresh copy within `within`.
+pub fn boss_restored_recently(within: Duration) -> bool {
+    with(|s| s.last_boss_restore_at.is_some_and(|t| t.elapsed() < within)).unwrap_or(false)
 }
 
 /// Dead and not reloaded yet, or less than `window` since the load after our death (v8.6).
@@ -421,6 +590,31 @@ pub fn after_death_guard(window: Duration) -> bool {
     with(|s| s.death_commits != s.commits_at_load || s.death_load_at.is_some_and(|t| t.elapsed() < window)).unwrap_or(false)
 }
 
+/// Pure check for whether our own player is currently dead without a live Resurrect prompt.
+pub(crate) fn our_currently_dead(player_dead: bool, committed: u32, spectating_now: bool) -> bool {
+    player_dead && (committed == 1 || spectating_now)
+}
+
+/// Pure check for whether a companion is currently dead for wipe detection.
+/// A peer who has reloaded or shows a living visible snapshot since dying is NOT dead.
+pub(crate) fn peer_currently_dead(
+    down: bool,
+    death_at: Option<Instant>,
+    loaded_at: Option<Instant>,
+    snap_alive: bool,
+) -> bool {
+    if down {
+        return true;
+    }
+    let Some(died) = death_at else {
+        return false;
+    };
+    if loaded_at.is_some_and(|l| l > died) {
+        return false;
+    }
+    !snap_alive
+}
+
 /// Every frame in the world while connected (puppet.rs, after livesync).
 pub struct Ctx<'a> {
     pub net: &'a mut Net,
@@ -431,29 +625,41 @@ pub struct Ctx<'a> {
     pub enemies: &'a Enemies,
     pub player: Chr,
     pub in_world_for: Duration,
+    /// Bitmask of peer slots confirmed down (`world::down_slots()`, `EV_DOWN(1)`).
+    pub down_slots: u32,
 }
 
 pub fn tick(c: Ctx) {
     let Ok(mut g) = STATE.lock() else { return };
     let st = g.get_or_insert_with(State::default);
     let now = Instant::now();
+    let mut notify_wipe_reload = false;
+    let mut trigger_wipe_respawn = false;
 
+    let mut reloaded_now = false;
     // A load: chr pointers and the per-load bookkeeping start over.
     if c.in_world_for < st.last_in_world {
+        reloaded_now = true;
         st.seen.clear();
         st.boss_checked.clear();
         st.killed_here.clear();
         st.last_lives.clear();
         st.enc_first.clear();
+        st.restored_this_load = false;
+        st.our_dead_at = None;
         // Boss records come back only after a real death reload of ours (E, 7.15).
         st.reload_after_death = st.death_commits != st.commits_at_load;
         st.commits_at_load = st.death_commits;
         st.death_load_at = st.reload_after_death.then_some(now);
         if std::mem::take(&mut st.hold_load) {
+            notify_wipe_reload = true;
             log::line("persist: reloaded after the wipe: records start over from the fresh world");
         }
     }
     st.last_in_world = c.in_world_for;
+
+    let peer_loaded: Vec<(PeerId, Option<Instant>)> = c.peers.iter().map(|p| (p.id, p.loaded_at)).collect();
+    update_wipe_window(now, reloaded_now, &peer_loaded);
 
     // A rest (ours or mirrored) resets the world for both.
     let rest = crate::restsync::last_rest();
@@ -461,37 +667,72 @@ pub fn tick(c: Ctx) {
         st.rest_seen = rest;
         st.clear("rest");
     }
-    // A wipe: every player (us and each connected peer) dead within 90 s. Each death is
-    // stamped when it happens, so a later death replaces an older one and can make a new
-    // wipe (no latch, §35). Only a COMMITTED death counts (7.15): HP 0 during a
-    // resurrection window made 3 false wipe clears while both were alive (live 7.13).
+    // A wipe: every player (us and each connected peer) dead within 90 s OR confirmed dead /
+    // spectating together regardless of fight duration. Only COMMITTED deaths or confirmed
+    // spectating (`EV_DOWN(1)` / `bossrules::spectating()`) count — NEVER raw `hp <= 0` during
+    // a Resurrect choice.
     let committed = game::read::<u32>(game::module_base() + DEATH_COMMITTED).unwrap_or(0);
     if commit_edge(st.our_committed, committed) {
         st.our_dead_at = Some(now);
         st.death_commits += 1;
     }
     st.our_committed = committed;
-    // Peers that left are no longer part of the wipe.
+    // Peers that left or reloaded alive since dying are no longer part of a pending wipe.
     st.peer_dead_at.retain(|id, _| c.peers.by_id(*id).is_some());
     for p in c.peers.iter() {
+        if st.peer_dead_at.get(&p.id).is_some_and(|&d| p.loaded_at.is_some_and(|l| l > d)) {
+            st.peer_dead_at.remove(&p.id);
+        }
         // Its committed death (EV_DEATH; its snapshot is hidden while dead). Snapshot HP 0
-        // alone is no death (7.15).
+        // alone is no death (7.15), and deaths from before the last wipe floor or reload are ignored.
         if let Some(t) = p.death_at
+            && p.loaded_at.is_none_or(|l| l <= t)
             && now.duration_since(t) <= WIPE_WINDOW
+            && st.wipe_floor.is_none_or(|f| t > f)
             && st.peer_dead_at.get(&p.id).is_none_or(|f| t > *f)
         {
             st.peer_dead_at.insert(p.id, t);
         }
     }
     let peer_deaths: Vec<Option<Instant>> = c.peers.iter().map(|p| st.peer_dead_at.get(&p.id).copied()).collect();
-    if let Some(set) = wipe_deaths(st.our_dead_at, &peer_deaths, st.wipe_cleared.as_deref()) {
-        st.wipe_cleared = Some(set);
-        mark_wipe();
-        st.clear(if peer_deaths.len() > 1 { "wipe (every player died)" } else { "wipe (both players died)" });
-        // Dead now: the bosses here are still the damaged ones until our reload.
-        if c.player.hp().is_some_and(|h| h <= 0) {
-            st.hold_load = true;
+    let spectating_now = crate::bossrules::spectating();
+    let player_dead = c.player.hp().is_some_and(|h| h <= 0);
+    if !player_dead && st.death_load_at.is_some_and(|l| st.our_dead_at.is_some_and(|d| l >= d)) {
+        st.our_dead_at = None;
+    }
+    let our_dead_now = our_currently_dead(player_dead, committed, spectating_now);
+    let peers_dead_now: Vec<bool> = c
+        .peers
+        .iter()
+        .map(|p| {
+            let down = p.id.slot() < 32 && (c.down_slots >> p.id.slot()) & 1 != 0;
+            let snap_alive = p.snapshot.is_some_and(|s| !s.hidden && s.hp > 0);
+            peer_currently_dead(down, st.peer_dead_at.get(&p.id).copied(), p.loaded_at, snap_alive)
+        })
+        .collect();
+    if !wipe_participants_dead(our_dead_now, &peers_dead_now) {
+        st.wipe_latched = false;
+    }
+    let wipe_by_window = wipe_deaths(st.our_dead_at, &peer_deaths, st.wipe_cleared.as_deref());
+    let wipe_by_down = !st.wipe_latched && wipe_participants_dead(our_dead_now, &peers_dead_now);
+    if wipe_by_window.is_some() || wipe_by_down {
+        if let Some(set) = wipe_by_window {
+            st.wipe_cleared = Some(set);
         }
+        st.wipe_latched = true;
+        let peer_ids: Vec<PeerId> = c.peers.iter().map(|p| p.id).collect();
+        arm_wipe(now, false, &peer_ids);
+        st.clear_wipe(
+            if peer_deaths.len() > 1 { "wipe (every player died)" } else { "wipe (both players died)" },
+            now,
+        );
+        // Dead now: the bosses here are still the damaged ones until our reload.
+        if player_dead {
+            st.hold_load = true;
+        } else {
+            trigger_wipe_respawn = true;
+        }
+        c.net.send_event(crate::world::EV_WIPE, 0, 0);
     }
     if st.our_dead_at.is_some_and(|x| now.duration_since(x) > WIPE_WINDOW) {
         st.our_dead_at = None;
@@ -596,6 +837,12 @@ pub fn tick(c: Ctx) {
         }
         st.stats_at = Some(now);
     }
+    drop(g);
+    if notify_wipe_reload {
+        crate::restsync::note_wipe_reload();
+    } else if trigger_wipe_respawn {
+        crate::world::respawn_all_wipe("local wipe");
+    }
 }
 
 fn scan(st: &mut State, enemies: &Enemies, in_world_for: Duration) {
@@ -686,6 +933,8 @@ fn boss_step(st: &mut State, chr: Chr, id: i32, alive: bool, lives0: i32) {
         let lives_ok = new_lives.is_none_or(|l| livesync::set_lives(data, lives, l, "persist restore"));
         let hp_ok = posture::set_hp(chr, new_hp);
         st.stats.bosses_restored += 1;
+        st.restored_this_load = true;
+        st.last_boss_restore_at = Some(Instant::now());
         st.log(format!(
             "persist: boss {id} restored hp {new_hp} lives {} after a death reload (record {}, ok = {})",
             new_lives.unwrap_or(lives),
@@ -891,5 +1140,80 @@ mod tests {
         assert_eq!(restore_plan(3000, 2, BossRec { hp: 0, max_hp: 3000, lives: 0, lives0: 2 }), None);
         // A single-life gauge boss: HP only.
         assert_eq!(restore_plan(5000, 1, BossRec { hp: 2500, max_hp: 5000, lives: 1, lives0: 1 }), Some((None, 2500)));
+    }
+
+    #[test]
+    fn wipe_participants_dead_checks_every_player_and_ignores_solo_or_live() {
+        assert!(!wipe_participants_dead(true, &[]), "solo death is never a wipe");
+        assert!(!wipe_participants_dead(false, &[true]), "we are still alive");
+        assert!(!wipe_participants_dead(true, &[false]), "peer still alive or deciding Resurrect");
+        assert!(!wipe_participants_dead(true, &[true, false]), "3-player fight: one companion alive");
+        assert!(wipe_participants_dead(true, &[true]), "both players dead or spectating (>90s works)");
+        assert!(wipe_participants_dead(true, &[true, true]), "all 3 players dead or spectating");
+    }
+
+    #[test]
+    fn smart_wipe_window_holds_until_all_reload_plus_settle_capped_at_max() {
+        let t0 = Instant::now();
+        let p1 = PeerId(1);
+        let p2 = PeerId(2);
+        let mut w = WipeWindow::new(t0, false, &[p1, p2]);
+        assert!(w.active(t0, WIPE_MAX_HOLD));
+        // Before WIPE_MIN_HOLD (6 s): active even if everyone somehow loaded instantly.
+        w.update(t0 + Duration::from_secs(2), true, &[(p1, Some(t0 + Duration::from_secs(2))), (p2, Some(t0 + Duration::from_secs(2)))]);
+        assert!(w.active(t0 + Duration::from_secs(5), WIPE_MAX_HOLD));
+        // Still active 1 s after WIPE_MIN_HOLD if all_reloaded was recorded at +2 s? Settle is 3 s from +2s -> +5s, wait: +2 + 3 = +5 < 6!
+        // When both finished loading at +8s, window stays active until +11s (3s settle), then clears (not 90s!).
+        let mut w2 = WipeWindow::new(t0, false, &[p1]);
+        w2.update(t0 + Duration::from_secs(4), true, &[(p1, Some(t0 - Duration::from_secs(1)))]);
+        assert!(w2.active(t0 + Duration::from_secs(7), WIPE_MAX_HOLD), "peer has not reloaded since wipe");
+        w2.update(t0 + Duration::from_secs(8), false, &[(p1, Some(t0 + Duration::from_secs(8)))]);
+        assert!(w2.active(t0 + Duration::from_secs(10), WIPE_MAX_HOLD), "inside 3s settle after reload");
+        assert!(!w2.active(t0 + Duration::from_secs(11), WIPE_MAX_HOLD), "cleared cleanly after settle for Attempt #2");
+        // Missed peer reload still expires at WIPE_MAX_HOLD (45s).
+        assert!(!w.active(t0 + WIPE_MAX_HOLD, WIPE_MAX_HOLD));
+    }
+
+    #[test]
+    fn clear_boss_encounter_drops_only_target_boss_and_keeps_other_state() {
+        with(|s| {
+            let r = BossRec { hp: 500, max_hp: 2000, lives: 1, lives0: 2 };
+            s.bosses.clear();
+            s.dead.clear();
+            s.bosses.insert(1000800, (r, false));
+            s.bosses.insert(1000810, (r, true));
+            s.bosses.insert(1100800, (r, false));
+            s.dead.insert(1100200);
+        });
+        clear_boss_encounter(1000810, "test");
+        with(|s| {
+            assert!(!s.bosses.contains_key(&1000800));
+            assert!(!s.bosses.contains_key(&1000810));
+            assert!(s.bosses.contains_key(&1100800), "unrelated boss preserved");
+            assert!(s.dead.contains(&1100200), "ordinary dead set preserved");
+            s.bosses.clear();
+            s.dead.clear();
+        });
+    }
+
+    #[test]
+    fn current_death_helpers_prevent_false_wipes_on_resurrect_or_reloaded_peers() {
+        let now = Instant::now();
+        let died = now - Duration::from_secs(5);
+        let reloaded = now - Duration::from_secs(1);
+
+        // Player at 0 HP with Resurrect available (`committed == 0`, not spectating) is not wiped.
+        assert!(!our_currently_dead(true, 0, false));
+        assert!(!our_currently_dead(false, 1, true));
+        assert!(our_currently_dead(true, 1, false));
+        assert!(our_currently_dead(true, 0, true));
+
+        // Peer who reloaded after dying is alive and cannot trigger a false wipe.
+        assert!(!peer_currently_dead(false, Some(died), Some(reloaded), false));
+        // Peer whose visible snapshot is alive is not dead even if an old timestamp lingered.
+        assert!(!peer_currently_dead(false, Some(died), None, true));
+        // Unreloaded dead peer or peer actively down (`EV_DOWN(1)`) counts as dead.
+        assert!(peer_currently_dead(false, Some(died), None, false));
+        assert!(peer_currently_dead(true, None, Some(reloaded), true));
     }
 }

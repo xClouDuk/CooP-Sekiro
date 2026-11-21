@@ -139,6 +139,36 @@ static REWARD_APPLYING: AtomicBool = AtomicBool::new(false);
 static COLLECTED: Mutex<Lots> = Mutex::new(Vec::new());
 static NOTICES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
 
+/// Frame task, in world: while non-zero and younger than `VICTORY_WARP_HOLD_MS`, `dead_step_detour`
+/// suppresses `CSDeadStep` so a Phase B boss-victory idol warp has no death screen or Sen/XP loss.
+static VICTORY_WARP_AT_MS: AtomicU64 = AtomicU64::new(0);
+const VICTORY_WARP_HOLD_MS: u64 = 12_000;
+
+/// Settling delay after a miniboss reaches 0 HP so `enemies.rs::loot_step` (1 s) pays Sen/XP before reload.
+const LOOT_SETTLE_MAX: Duration = Duration::from_millis(1600);
+/// Wait after loading screen on post-boss revive before refilling gourd/storage cleanly at Idol.
+const POST_BOSS_REVIVE_DELAY: Duration = Duration::from_secs(1);
+const POST_BOSS_REVIVE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn victory_warp_suppressing() -> bool {
+    let at = VICTORY_WARP_AT_MS.load(Ordering::Acquire);
+    at != 0 && mono_ms().saturating_sub(at) < VICTORY_WARP_HOLD_MS
+}
+
+/// Original death position & angle while the spectating corpse has been shifted toward a living
+/// companion to keep map geometry/AI streamed.
+static SPECTATE_FROZEN_POS: Mutex<Option<([f32; 3], f32)>> = Mutex::new(None);
+/// True while our local corpse has been moved for streaming while spectating dead.
+static SPECTATE_ANCHORED: AtomicBool = AtomicBool::new(false);
+
+pub fn spectate_frozen_death_pos() -> Option<([f32; 3], f32)> {
+    SPECTATE_FROZEN_POS.lock().ok().and_then(|g| *g)
+}
+
+pub fn spectate_streaming_anchored() -> bool {
+    SPECTATE_ANCHORED.load(Ordering::Acquire)
+}
+
 /// An AwardItemLot this soon after a boss defeat belongs to the boss.
 const REWARD_WINDOW_MS: u64 = 15_000;
 /// The killer sends its lots this long after the defeat (the fight's awards are done).
@@ -422,6 +452,9 @@ extern "C" fn dead_step_detour(step: usize) -> bool {
     if !crate::mod_alive() {
         return true;
     }
+    if victory_warp_suppressing() {
+        return false;
+    }
     // v8.15: read the two window fields on every dead frame (atomics only), so the frame task can
     // log them whichever branch below runs (phase B is off, the reads used to happen only there).
     let window_closed = no_revive_window();
@@ -442,9 +475,7 @@ extern "C" fn dead_step_detour(step: usize) -> bool {
             let waited = now.saturating_sub(start);
             let sp_no = SP_NO_REVIVE.load(Ordering::Acquire);
             let mut cached = RES_ELIGIBLE.load(Ordering::Acquire);
-            if cached != ELIG_YES
-                && let Some(fresh) = read_resurrect_eligible()
-            {
+            if let Some(fresh) = read_resurrect_eligible() {
                 cached = if fresh { ELIG_YES } else { ELIG_NO };
                 RES_ELIGIBLE.store(cached, Ordering::Release);
             }
@@ -1084,6 +1115,42 @@ struct Engage {
     recent_boss: bool,
 }
 
+/// Companion is considered present in our block while alive OR still within the `DEAD_AFTER`
+/// grace window on `hp == 0` (so a companion currently on their Resurrect prompt keeps us in spectate).
+fn peer_here(snap: Option<Snapshot>, here: Option<i32>, dead_for: Option<Duration>) -> bool {
+    snap.is_some_and(|r| here == Some(r.block) && (r.hp > 0 || dead_for.is_none_or(|d| d < DEAD_AFTER)))
+}
+
+/// Pure decision for whether a Phase B spectate release runs the clean Idol victory warp
+/// (discarding any late held Lua death load so the Sculptor cutscene / Dragonrot popups never fire).
+pub(crate) fn phase_b_boss_defeat_warps(was_phase_b: bool, reason: &str) -> bool {
+    was_phase_b && reason == "boss defeated"
+}
+
+const STREAM_ANCHOR_TRIGGER_M: f32 = 45.0;
+const STREAM_ANCHOR_LAG_M: f32 = 12.0;
+const STREAM_CRUMB_STEP_M: f32 = 3.0;
+const STREAM_CRUMB_MAX: usize = 32;
+
+/// Keeps a spectating corpse within world-streaming range (`<= STREAM_ANCHOR_TRIGGER_M`) of the
+/// living companion's breadcrumb trail so distant areas, collision, and enemies remain loaded.
+pub(crate) fn choose_stream_anchor(
+    me_pos: [f32; 3],
+    peer_pos: [f32; 3],
+    crumbs: &[[f32; 3]],
+) -> Option<[f32; 3]> {
+    if game::distance(me_pos, peer_pos) <= STREAM_ANCHOR_TRIGGER_M {
+        return None;
+    }
+    if let Some(&crumb) = crumbs.iter().rev().find(|&&c| {
+        let d = game::distance(c, peer_pos);
+        d >= STREAM_ANCHOR_LAG_M && d <= STREAM_ANCHOR_TRIGGER_M - 5.0
+    }) {
+        return Some(crumb);
+    }
+    Some(peer_pos)
+}
+
 /// The peers engaged in our fight: in its own fight (or near us while we fight), alive in
 /// our block, not down. Two players: exactly the old `in_fight && friend_here && !friend_down`.
 fn engaged_ids(list: &[Engage], our_fight: bool) -> Vec<PeerId> {
@@ -1162,6 +1229,7 @@ fn hand_back(why: &str, run_reload: bool) -> bool {
 /// or when the mod disables itself: no static may keep the game waiting. The free
 /// cam goes back, phase B lets the death through, a held reload runs now.
 pub fn emergency_reset(why: &str) {
+    VICTORY_WARP_AT_MS.store(0, Ordering::Release);
     let cam = spectate_cam::restore_now();
     let held = hand_back(why, true);
     if cam || held {
@@ -1173,6 +1241,7 @@ pub fn emergency_reset(why: &str) {
 /// spectator camera goes back and any wait ends; a held death reload is dropped (we live).
 /// True when something was let go.
 pub fn alive_stuck_reset(why: &str) -> bool {
+    VICTORY_WARP_AT_MS.store(0, Ordering::Release);
     let cam = spectate_cam::restore_now();
     let held = hand_back(why, false);
     log::line(&format!("bossrules: {why}: camera restored {cam}, wait ended {held}"));
@@ -1224,7 +1293,7 @@ fn alive_wait_over(state: u8, alive_for: Duration) -> bool {
 /// text says what the dark screen is.
 fn wait_overlay(phase_a: bool, name: &str, f8: bool) -> String {
     let mut s = if phase_a {
-        format!("Waiting for {name} to end the boss fight\nThe screen stays dark until then; you wake at your idol")
+        format!("Waiting for {name} to end the boss fight\nThe screen stays dark until then; you will revive when it ends")
     } else {
         format!("Spectating {name}")
     };
@@ -1339,6 +1408,12 @@ struct Recording {
     entries: Vec<(i64, u32, bool)>,
 }
 
+struct PostBossRevive {
+    boss_entity: i32,
+    armed_at: Instant,
+    saw_loading: bool,
+}
+
 #[derive(Default)]
 pub struct BossRules {
     /// Gauge seen last frame: (boss entity, name id).
@@ -1429,6 +1504,12 @@ pub struct BossRules {
     last_switch: Option<(Instant, i32)>,
     /// The arrival line (a peer's fight in our block after a load) was written for this load.
     arrival_logged: bool,
+    /// Post-boss Idol refill pending after a spectating victory warp.
+    post_boss_revive: Option<PostBossRevive>,
+    miniboss_dead_at: Option<Instant>,
+    /// Breadcrumb trail of the spectated companion used to keep world streaming anchored.
+    stream_crumbs: std::collections::VecDeque<[f32; 3]>,
+    stream_anchor: Option<[f32; 3]>,
 }
 
 /// An HBD / defeat flag younger than this still counts as "the encounter is defeated".
@@ -1529,6 +1610,15 @@ impl BossRules {
         self.overlay.as_deref()
     }
 
+    fn clear_stream_anchor(&mut self) {
+        self.stream_crumbs.clear();
+        self.stream_anchor = None;
+        SPECTATE_ANCHORED.store(false, Ordering::Release);
+        if let Ok(mut g) = SPECTATE_FROZEN_POS.lock() {
+            *g = None;
+        }
+    }
+
     /// A warp is under way: no decisions, and no reload is held back. Our warps
     /// need a living player (`game::safe_to_warp`), so a wait here means we died
     /// during the warp's fade: the state is ended like a release (a held reload
@@ -1536,6 +1626,7 @@ impl BossRules {
     /// through) instead of leaving `SPEC_STATE` for `on_loading` (review finding 7).
     pub fn hands_off(&mut self) {
         self.cam.release("warp");
+        self.clear_stream_anchor();
         if hand_back("warp under way", true) {
             self.overlay = None;
             self.spec_since = None;
@@ -1555,11 +1646,18 @@ impl BossRules {
         if spectating() && gone < NO_PLAYER_MAX {
             return;
         }
+        VICTORY_WARP_AT_MS.store(0, Ordering::Release);
+        self.clear_stream_anchor();
+        self.keys.on_loading();
         self.cam.release("loading");
         // A real load (or the title): a reload we still hold is not run any more.
         if hand_back("loading screen", false) {
             log::line("spectate: loading screen, state reset");
         }
+        if let Some(r) = self.post_boss_revive.as_mut() {
+            r.saw_loading = true;
+        }
+        self.miniboss_dead_at = None;
         self.gauge = None;
         self.boss_while_alive = false;
         self.mini = None;
@@ -1600,6 +1698,9 @@ impl BossRules {
         let hp = player.hp();
         let alive = hp.is_some_and(|h| h > 0);
         let dead = hp.is_some_and(|h| h <= 0);
+        if alive {
+            VICTORY_WARP_AT_MS.store(0, Ordering::Release);
+        }
         self.pump_flags(now);
 
         // HandleBossDefeat in our world (SPEC §4.2).
@@ -1742,7 +1843,7 @@ impl BossRules {
                     boss: world.peer_boss(p.id).is_some(),
                     recent_boss: world.peer_recent_boss(p.id, PEER_BOSS_GRACE),
                     near: r.zip(me_pos).is_some_and(|(r, q)| game::distance(r.pos, q) <= FRIEND_NEAR_M),
-                    here: r.is_some_and(|r| r.hp > 0 && here == Some(r.block)),
+                    here: peer_here(r, here, p.dead_since.map(|t| t.elapsed())),
                     // Down on its death screen, or its death committed and no load since (the reload).
                     down: world.peer_down(p.id) || world.peer_death_at(p.id).is_some_and(|t| !loaded_since(p, t)),
                 }
@@ -1881,7 +1982,9 @@ impl BossRules {
             }
         }
 
-        self.spectate_step(&mut net, world, peers, &engaged, here, connected, wake, release, now);
+        if self.spectate_step(&mut net, world, peers, &engaged, here, connected, wake, release, now) {
+            return true;
+        }
         self.dead_watchdog(dead, now);
 
         // The camera: dead and waiting (either phase), never on a living player. It follows
@@ -1895,6 +1998,46 @@ impl BossRules {
         let boss_hint = (self.wait_boss > 0).then_some(self.wait_boss).or((self.last_gauge > 0).then_some(self.last_gauge));
         self.cam.update_peers(cam_wanted, peers, me_pos, &in_wait, boss_hint);
         self.cam_target = self.cam.target();
+        if SPEC_STATE.load(Ordering::Acquire) == SPEC_SPECTATE
+            && dead
+            && self.spec_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(2))
+        {
+            let watched_peer = self.cam_target.or_else(|| {
+                self.watch.iter().find(|(_, w)| w.out.is_none()).map(|(&id, _)| id)
+            });
+            let peer_pos = watched_peer
+                .and_then(|id| peers.iter().find(|p| p.id == id))
+                .and_then(|p| p.snapshot)
+                .filter(|r| !r.hidden && r.hp > 0 && here == Some(r.block) && game::sane_pos(r.pos))
+                .map(|r| r.pos);
+            if let Some(p_pos) = peer_pos {
+                if self.stream_crumbs.back().is_none_or(|&b| game::distance(b, p_pos) >= STREAM_CRUMB_STEP_M) {
+                    if self.stream_crumbs.len() >= STREAM_CRUMB_MAX {
+                        self.stream_crumbs.pop_front();
+                    }
+                    self.stream_crumbs.push_back(p_pos);
+                }
+                if let Some(mp) = me_pos {
+                    let crumbs: Vec<[f32; 3]> = self.stream_crumbs.iter().copied().collect();
+                    if let Some(anchor) = choose_stream_anchor(mp, p_pos, &crumbs) {
+                        if let Ok(mut g) = SPECTATE_FROZEN_POS.lock()
+                            && g.is_none()
+                        {
+                            *g = Some((mp, player.angle().unwrap_or(0.0)));
+                        }
+                        SPECTATE_ANCHORED.store(true, Ordering::Release);
+                        let moved_m = game::distance(mp, anchor);
+                        let ok = player.set_position(anchor, 0.0);
+                        self.stream_anchor = Some(anchor);
+                        log::line(&format!(
+                            "spectate: streaming anchor moved corpse {moved_m:.0} m toward companion (ok = {ok})"
+                        ));
+                    }
+                }
+            }
+        } else if SPECTATE_ANCHORED.load(Ordering::Relaxed) || !self.stream_crumbs.is_empty() {
+            self.clear_stream_anchor();
+        }
         self.reward_step(&mut net, connected, in_world_for);
         self.keys.on_frame(&mut net, peers, connected, in_world_for);
         // Boss start gate: each peer's fight flags wait while we are far from that peer.
@@ -1922,6 +2065,7 @@ impl BossRules {
                 log::line(&crate::bossgate::stats());
             }
         }
+        self.post_boss_revive_step(world, alive, in_world_for);
         self.expel_step(alive, in_world_for)
     }
 
@@ -2003,6 +2147,7 @@ impl BossRules {
     }
 
     /// The state machine of the death-screen wait: start, end conditions, release.
+    /// Returns `true` if a direct victory idol warp started this frame (caller drops pointers).
     #[allow(clippy::too_many_arguments)]
     fn spectate_step(
         &mut self,
@@ -2015,7 +2160,7 @@ impl BossRules {
         wake: bool,
         mut release: Option<&'static str>,
         now: Instant,
-    ) {
+    ) -> bool {
         let started_a = SPEC_STARTED.swap(false, Ordering::AcqRel);
         let started_b = SPEC_B_STARTED.swap(false, Ordering::AcqRel);
         let outs = PEER_OUT.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
@@ -2023,6 +2168,8 @@ impl BossRules {
         if started_a || started_b {
             self.spec_since = Some(now);
             self.held_release = None;
+            self.post_boss_revive = None;
+            self.miniboss_dead_at = None;
             // Whom this wait holds for: the peers engaged in our fight (two players: the friend).
             self.watch = engaged.iter().map(|&id| (id, Watch::default())).collect();
             if self.watch.is_empty()
@@ -2273,14 +2420,25 @@ impl BossRules {
                 if release.is_none() && (wake || f8_edge) {
                     release = Some("user");
                 }
-                // The friend killed the miniboss we died to (loaded here, now at 0 HP): the
-                // same release as a boss defeat, through the check below.
+                // The friend killed the miniboss we died to (loaded here, now at 0 HP): allow
+                // `enemies.rs::loot_step` up to `LOOT_SETTLE_MAX` (or `persist::rewarded`) to
+                // credit Sen/XP before the reload runs.
                 if release.is_none()
                     && self.wait_mini
                     && game::chr_by_entity_id(self.wait_boss).and_then(|c| c.hp()).is_some_and(|h| h <= 0)
                 {
-                    log::line(&format!("spectate: miniboss {} is dead here, releasing as boss defeated", self.wait_boss));
-                    release = Some("boss defeated");
+                    let dead_for = now.duration_since(*self.miniboss_dead_at.get_or_insert(now));
+                    if crate::persist::rewarded(self.wait_boss) || dead_for >= LOOT_SETTLE_MAX {
+                        log::line(&format!(
+                            "spectate: miniboss {} is dead here ({} ms settle), releasing as boss defeated",
+                            self.wait_boss,
+                            dead_for.as_millis()
+                        ));
+                        self.miniboss_dead_at = None;
+                        release = Some("boss defeated");
+                    }
+                } else {
+                    self.miniboss_dead_at = None;
                 }
                 // The friend's "boss defeated" before our world saw the defeat: a reload
                 // now could bring the boss back here (its defeat flag not written yet).
@@ -2294,7 +2452,9 @@ impl BossRules {
                     };
                     let since = *self.defeat_wait.get_or_insert(now);
                     let waited = now.duration_since(since);
-                    if ours || boss_dead || waited >= DEFEAT_WAIT_MAX {
+                    let settled_for_mini =
+                        self.wait_enc.is_some() || crate::persist::rewarded(self.wait_boss) || waited >= LOOT_SETTLE_MAX;
+                    if ((ours || boss_dead) && settled_for_mini) || waited >= DEFEAT_WAIT_MAX {
                         if waited >= Duration::from_millis(100) {
                             log::line(&format!(
                                 "spectate: boss {} defeat {} after {} ms, releasing",
@@ -2319,7 +2479,7 @@ impl BossRules {
                 // is retried every frame (cutscene.rs; at most `POSTPONE_MAX`).
                 release = postpone_release(release, &mut self.held_release, crate::cutscene::any_in_cutscene(), now);
                 if let Some(reason) = release {
-                    self.release(reason, net, world, peers);
+                    return self.release(reason, net, world, peers);
                 }
             }
             SPEC_RELEASING => {
@@ -2354,6 +2514,7 @@ impl BossRules {
             }
             _ => self.overlay = None,
         }
+        false
     }
 
     /// "Link lost" after its grace period; "friend left the block" when the wait has nobody
@@ -2376,24 +2537,38 @@ impl BossRules {
         None
     }
 
-    /// Phase A: runs the reload we held back. Phase B: lets the CSDeadStep through
-    /// (penalty, death screen, its own reload). The load that follows ends the state.
-    fn release(&mut self, reason: &'static str, net: &mut Option<&mut Net>, world: &mut World, peers: &PeerSet) {
+    /// Phase A: runs the reload we held back. Phase B: warps cleanly on boss defeat (no death
+    /// screen or Sen/XP penalty) or lets CSDeadStep through. Returns `true` if `warp_to_idol` ran.
+    fn release(&mut self, reason: &'static str, net: &mut Option<&mut Net>, world: &mut World, peers: &PeerSet) -> bool {
         let secs = self.spec_since.map_or(0, |t| t.elapsed().as_secs());
         log::line(&format!("spectate: release {reason} after {secs} s"));
         self.defeat_wait = None;
-        // Our held death reload runs below; a post-boss warp of the killer is followed (join.rs).
+        self.miniboss_dead_at = None;
+        self.clear_stream_anchor();
+        // Arm clean Idol refill on victory (and follow killer on dream warps if they move on).
         if reason == "boss defeated" {
             crate::join::note_boss_fell_while_dead();
+            self.post_boss_revive = Some(PostBossRevive {
+                boss_entity: self.wait_boss,
+                armed_at: Instant::now(),
+                saw_loading: false,
+            });
+        } else {
+            self.post_boss_revive = None;
         }
         // Every peer we waited for died. A session wipe only when that is every connected
-        // peer (two players: always); a living peer elsewhere keeps the world (persist rule).
+        // peer (two players: always); a living peer elsewhere clears only this boss encounter.
         if reason == "wipe" && peers.iter().all(|p| self.watch.contains_key(&p.id)) {
             world.note_wipe(peers);
             // Both died: bosses and the dead set start over (persist.rs).
-            crate::persist::note_wipe("boss wipe");
+            crate::persist::note_wipe("boss wipe", peers);
+            send(net, world::EV_WIPE, 0, 0);
         } else if reason == "wipe" {
-            log::line("spectate: everyone in the fight died, but a companion elsewhere lives: no session wipe");
+            log::line("spectate: everyone in the fight died, but a companion elsewhere lives: clearing only this boss encounter");
+            crate::persist::clear_boss_encounter(self.wait_boss, "boss fight wipe");
+            if self.wait_boss > 0 {
+                send(net, world::EV_WIPE, self.wait_boss, 0);
+            }
         }
         self.watch.clear();
         self.cam_target = None;
@@ -2412,6 +2587,17 @@ impl BossRules {
         let held_reload = HELD_RELOAD.swap(false, Ordering::AcqRel);
         self.load_args_logged = false;
         if was == SPEC_SPECTATE {
+            if phase_b_boss_defeat_warps(true, reason) {
+                let idol = game::last_idol();
+                VICTORY_WARP_AT_MS.store(mono_ms(), Ordering::Release);
+                crate::invguard::snapshot_before_reload();
+                log::line(&format!(
+                    "spectate: boss {} defeated in phase B: victory warp to last idol {idol} (held_load={held_load}, held_reload={held_reload} discarded)",
+                    self.wait_boss
+                ));
+                game::warp_to_idol(idol);
+                return true;
+            }
             // A load request held while we spectated (live 2026-10-24: the Lua event warp
             // 0x68E850) was the only thing that would reload. Its arguments may point into a
             // stack frame that is long gone. v8.28a: it is replayed anyway (the null-arg reload
@@ -2435,10 +2621,11 @@ impl BossRules {
                     }
                 }
             }
-            return;
+            return false;
         }
         let ret = replay_or_reload(held_load, armed);
         log::line(&format!("spectate: original reload called (returned {ret:#x})"));
+        false
     }
 
     /// Calls the game's own death reload now (a dead player that no load follows) and
@@ -2492,6 +2679,40 @@ impl BossRules {
             log::line("boss: the friend's fight is gated here: its start flags wait until we are near");
         }
         notice(text, 8);
+    }
+
+    /// After a spectating player's boss falls: once reloaded into a live world, refill HP/posture/Gourd/
+    /// Resurrect + restock consumables strictly from Storage Box (`refill_player_direct()`), then
+    /// return them to their saved death location (or alongside the victor on dream/warp bosses).
+    fn post_boss_revive_step(
+        &mut self,
+        world: &mut World,
+        alive: bool,
+        in_world_for: Duration,
+    ) {
+        let Some(r) = self.post_boss_revive.as_ref() else {
+            return;
+        };
+        if r.armed_at.elapsed() >= POST_BOSS_REVIVE_TIMEOUT {
+            log::line(&format!(
+                "spectate: post-boss revive timed out after {} s (boss {})",
+                r.armed_at.elapsed().as_secs(),
+                r.boss_entity
+            ));
+            self.post_boss_revive = None;
+            return;
+        }
+        if !r.saw_loading || !alive || in_world_for < POST_BOSS_REVIVE_DELAY || crate::cutscene::active() {
+            return;
+        }
+        let ok = crate::world::refill_player_direct();
+        world.mark_death_refilled();
+        log::line(&format!(
+            "spectate: post-boss revive at Idol complete for boss {} (gourd/hp/resurrect + storage restock, ok = {ok})",
+            r.boss_entity
+        ));
+        notice("Boss defeated - revived at Idol (gourd & storage restocked)".into(), 8);
+        self.post_boss_revive = None;
     }
 
     /// Sends our boss lots to the friend; applies the ones that arrived (SPEC §4.2).
@@ -3065,6 +3286,46 @@ mod tests {
     fn phase_a_says_the_screen_is_dark() {
         assert_eq!(wait_overlay(false, "Kuro", false), "Spectating Kuro");
         assert!(wait_overlay(true, "Kuro", false).contains("stays dark"));
+        assert!(wait_overlay(true, "Kuro", false).contains("will revive"));
         assert!(wait_overlay(true, "Kuro", true).ends_with("[F8] wake at idol"));
+    }
+
+    #[test]
+    fn peer_here_holds_companions_on_resurrect_screen() {
+        let alive = Some(Snapshot { hp: 500, block: 2, ..Default::default() });
+        let zero = Some(Snapshot { hp: 0, block: 2, ..Default::default() });
+        let away = Some(Snapshot { hp: 500, block: 3, ..Default::default() });
+        assert!(peer_here(alive, Some(2), None));
+        assert!(peer_here(zero, Some(2), None), "first frame at 0 HP");
+        assert!(peer_here(zero, Some(2), Some(Duration::from_secs(2))), "choosing Resurrect");
+        assert!(!peer_here(zero, Some(2), Some(DEAD_AFTER)), "expired 0 HP fallback");
+        assert!(!peer_here(away, Some(2), None), "different map block");
+        assert!(!peer_here(None, Some(2), None), "hidden / disconnected");
+    }
+
+    #[test]
+    fn phase_b_boss_defeat_warps_unconditionally() {
+        assert!(phase_b_boss_defeat_warps(true, "boss defeated"));
+        assert!(!phase_b_boss_defeat_warps(false, "boss defeated"));
+        assert!(!phase_b_boss_defeat_warps(true, "wipe"));
+    }
+
+    #[test]
+    fn choose_stream_anchor_keeps_corpse_in_streaming_range_without_crowding_peer() {
+        let me = [0.0, 0.0, 0.0];
+        // Within 45 m: stay put.
+        assert_eq!(choose_stream_anchor(me, [30.0, 0.0, 0.0], &[]), None);
+        assert_eq!(choose_stream_anchor(me, [45.0, 0.0, 0.0], &[]), None);
+        // Beyond 45 m with a breadcrumb trail: picks latest crumb 12..=40 m behind peer.
+        let peer = [100.0, 0.0, 0.0];
+        let crumbs = [
+            [20.0, 0.0, 0.0], // 80 m away (too far)
+            [65.0, 0.0, 0.0], // 35 m away (valid)
+            [80.0, 0.0, 0.0], // 20 m away (valid, latest)
+            [95.0, 0.0, 0.0], // 5 m away (too close)
+        ];
+        assert_eq!(choose_stream_anchor(me, peer, &crumbs), Some([80.0, 0.0, 0.0]));
+        // Beyond 45 m with no valid trailing crumb: falls back to peer_pos.
+        assert_eq!(choose_stream_anchor(me, peer, &[[10.0, 0.0, 0.0]]), Some(peer));
     }
 }

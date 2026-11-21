@@ -79,6 +79,8 @@ pub enum TransportSetting {
 /// file's `role` key is ignored like any unknown key.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NetSettings {
+    /// 1 (default) = private Steam invite-only lobbies (no password required); 0 = legacy password / UDP mode.
+    pub steam_invites: bool,
     pub password: String,
     /// Empty = the Steam name, else "Wolf" (resolved by `net`).
     pub player_name: String,
@@ -94,9 +96,18 @@ pub struct NetSettings {
     pub loopback_peers: u8,
 }
 
+impl NetSettings {
+    /// True when Steam Invite mode governs item actions / lobby creation.
+    /// Explicit `transport = udp` switches straight to Direct UDP unless a Steam overlay invite was just accepted.
+    pub fn uses_steam_invites(&self, has_invite: bool) -> bool {
+        has_invite || (self.steam_invites && self.transport != TransportSetting::Udp)
+    }
+}
+
 impl Default for NetSettings {
     fn default() -> Self {
         Self {
+            steam_invites: true,
             password: String::new(),
             player_name: String::new(),
             transport: TransportSetting::Auto,
@@ -137,6 +148,31 @@ pub const PARTY_CONTENT_HP_NUMBERS: u8 = 2;
 static OVERHEAD: AtomicU8 = AtomicU8::new(0);
 /// `observe` as read at start-up.
 static OBSERVE_AT_START: AtomicBool = AtomicBool::new(true);
+/// Lock-free mirror of `NetSettings::steam_invites` and `NetSettings::transport` for per-frame UI/item reads.
+static STEAM_INVITES: AtomicBool = AtomicBool::new(true);
+/// 0 = Auto, 1 = Steam, 2 = Udp.
+static TRANSPORT: AtomicU8 = AtomicU8::new(0);
+
+fn store_net_atomics(net: &NetSettings) {
+    STEAM_INVITES.store(net.steam_invites, Relaxed);
+    TRANSPORT.store(
+        match net.transport {
+            TransportSetting::Auto => 0,
+            TransportSetting::Steam => 1,
+            TransportSetting::Udp => 2,
+        },
+        Relaxed,
+    );
+}
+
+#[allow(dead_code)]
+pub fn steam_invites() -> bool {
+    STEAM_INVITES.load(Relaxed)
+}
+
+pub fn uses_steam_invites() -> bool {
+    STEAM_INVITES.load(Relaxed) && TRANSPORT.load(Relaxed) != 2
+}
 
 pub fn net() -> NetSettings {
     STATE.lock().ok().and_then(|s| s.as_ref().map(|s| s.net.clone())).unwrap_or_default()
@@ -304,6 +340,7 @@ fn parse_net(ini: &Ini, warn: &mut Vec<String>) -> NetSettings {
         }
     };
     NetSettings {
+        steam_invites: ini.flag("steam_invites", true, warn),
         password: ini.text("password"),
         player_name: ini.text("player_name"),
         transport,
@@ -462,13 +499,23 @@ const TEMPLATE: &str = "\
 ; CooP Sekiro settings. Lines starting with ; are comments.
 ; The game re-reads this file about every 2 seconds, so most changes apply at once.
 ;
-; How to play together: both players write the same password below. After the
-; tutorial, rest at the Dilapidated Temple idol: you get three co-op items (Goods).
+; How to play together: after the tutorial, rest at the Dilapidated Temple idol to
+; receive the three co-op items (Goods):
 ;   Kindred Bell   = open your world (host).
-;   Kindred Charm  = find your friend's world and join it.
+;   Kindred Charm  = find your friend's world and join it (when steam_invites = 0).
 ;   Severed Thread = leave co-op / close your world.
 
-; Both players must use the same password. Co-op stays off while it is empty.
+; 1 (default) = Steam Invite mode: open a private invite-only lobby with Kindred Bell,
+;     then ring Kindred Bell a second time while hosting to open the Steam Invite menu
+;     and invite friends. Friends join by accepting the invite in Steam (\"Join Game\").
+;     No password is required, and only players you specifically invite can join
+;     (lobby is private, never public or searchable).
+; 0 = Password / UDP mode: requires the same password below on all machines (searches by
+;     password over Steam or connects via direct UDP).
+steam_invites = 1
+
+; Password for co-op when steam_invites = 0 (or over direct UDP). With steam_invites = 1
+; you can leave this empty; if set while steam_invites = 1, invited friends must also match it.
 ; It is never sent anywhere as text, only as a one-way hash.
 password = @PASSWORD@
 ; Name shown above your head. Empty = your Steam name.
@@ -688,8 +735,9 @@ native_notices = 0
 
 [ADVANCED]
 ; Changing anything here (or the password / name) restarts the connection.
-; auto = Steam; if Steam does not work within 15 seconds, direct UDP instead.
-; steam = Steam only. udp = direct UDP only (the host's port must be reachable).
+; auto = Steam (falls back to Direct UDP if Steam lobbies are unavailable and a password is set).
+; steam = Steam only. udp = Direct UDP only (connects immediately, requires a password below;
+;     no need to change steam_invites). Can also be switched in-game in Options > CooP Sekiro Settings.
 transport = @TRANSPORT@
 ; Joining over UDP: the host's IP address, e.g. 203.0.113.7 or 203.0.113.7:28100.
 ; A UDP host finds its address in udp_join_code.txt next to this file.
@@ -871,7 +919,8 @@ fn load_text() -> Option<String> {
 
 fn describe(n: &NetSettings) -> String {
     format!(
-        "transport {:?}, udp {}:{}, name {:?}, password {}, auto_connect {}, loopback {}, loopback_peers {}",
+        "steam_invites {}, transport {:?}, udp {}:{}, name {:?}, password {}, auto_connect {}, loopback {}, loopback_peers {}",
+        n.steam_invites,
         n.transport,
         if n.udp_host_address.is_empty() { "-" } else { n.udp_host_address.as_str() },
         n.udp_port,
@@ -891,6 +940,7 @@ pub fn init() {
     let ini = Ini::parse(&text);
     let mut warn = Vec::new();
     let net = parse_net(&ini, &mut warn);
+    store_net_atomics(&net);
     apply(&ini, &mut warn);
     for w in &warn {
         log::line(&format!("settings: {w}"));
@@ -922,6 +972,7 @@ pub fn tick() {
     let ini = Ini::parse(&text);
     let mut warn = Vec::new();
     let net = parse_net(&ini, &mut warn);
+    store_net_atomics(&net);
     // `apply` looks at STATE for the start-up-only `observe`: it is set by now.
     drop(guard);
     apply(&ini, &mut warn);
@@ -1257,12 +1308,38 @@ mod tests {
         assert!(warn.is_empty(), "{warn:?}");
     }
 
-    /// The top of the generated file is what a player needs: the password and the name
-    /// come before every section, [ADVANCED] and [DEBUG] are last and nothing names a role.
+    #[test]
+    fn steam_invites_defaults_on_and_toggles_off() {
+        let mut warn = Vec::new();
+        assert!(parse_net(&Ini::parse(""), &mut warn).steam_invites);
+        assert!(parse_net(&Ini::parse(&default_text()), &mut warn).steam_invites);
+        assert!(!parse_net(&Ini::parse("steam_invites = 0\n"), &mut warn).steam_invites);
+        assert!(parse_net(&Ini::parse("steam_invites = 1\n"), &mut warn).steam_invites);
+        assert!(warn.is_empty(), "{warn:?}");
+    }
+
+    #[test]
+    fn uses_steam_invites_respects_explicit_udp_and_pending_invites() {
+        let auto_inv = NetSettings::default();
+        assert!(auto_inv.uses_steam_invites(false));
+        assert!(auto_inv.uses_steam_invites(true));
+
+        let udp = NetSettings { transport: TransportSetting::Udp, ..Default::default() };
+        assert!(!udp.uses_steam_invites(false));
+        assert!(udp.uses_steam_invites(true));
+
+        let pass = NetSettings { steam_invites: false, transport: TransportSetting::Auto, ..Default::default() };
+        assert!(!pass.uses_steam_invites(false));
+        assert!(pass.uses_steam_invites(true));
+    }
+
+    /// The top of the generated file is what a player needs: `steam_invites`, the password and the
+    /// name come before every section, [ADVANCED] and [DEBUG] are last and nothing names a role.
     #[test]
     fn default_file_layout() {
         let t = default_text();
         let at = |s: &str| t.find(s).unwrap_or_else(|| panic!("{s} missing"));
+        assert!(at("steam_invites =") < at("[GAMEPLAY]"));
         assert!(at("password =") < at("[GAMEPLAY]"));
         assert!(at("player_name =") < at("[GAMEPLAY]"));
         assert!(at("[GAMEPLAY]") < at("[DISPLAY]") && at("[DISPLAY]") < at("[ADVANCED]") && at("[ADVANCED]") < at("[DEBUG]"));

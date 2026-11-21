@@ -172,8 +172,8 @@ fn texts(kind: Kind) -> [*const u16; 3] {
     match kind {
         Kind::Host => [
             wide!("Kindred Bell"),
-            wide!("Ring to open your world to a companion who shares your password."),
-            wide!("A small bell bound by a shared vow.\nIts faint toll carries far, to one who knows the vow.\n\nRing it to open your world to a companion\nwho shares your password."),
+            wide!("Ring to open your world to companions. Ring again while hosting to invite friends via Steam."),
+            wide!("A small bell bound by a shared vow.\nIts faint toll carries far, to one who knows the vow.\n\nRing it to open your world to companions.\nRing it again while waiting to open the Steam invite menu."),
         ],
         Kind::Join => [
             wide!("Kindred Charm"),
@@ -225,6 +225,9 @@ pub fn solo_hint() -> String {
     match STAGE.load(Ordering::Relaxed) {
         STAGE_TUTORIAL => "co-op unlocks after the tutorial, at the Dilapidated Temple idol".into(),
         STAGE_REST => "rest at an idol to receive the co-op items".into(),
+        STAGE_READY if settings::uses_steam_invites() => {
+            format!("use {HOST_NAME} to host, or accept a Steam invite to join")
+        }
         STAGE_READY => format!("use {HOST_NAME} to host or {JOIN_NAME} to join"),
         STAGE_FAILED => "co-op items unavailable (see log.txt), use auto_connect = 1".into(),
         _ => "solo".into(),
@@ -274,6 +277,7 @@ extern "C" fn info_detour(repo: usize, id: u32) -> *const u16 {
 }
 
 extern "C" fn caption_detour(repo: usize, id: u32) -> *const u16 {
+    crate::itemdrop::note_hovered_goods(id);
     match kind_of(id) {
         Some(k) => texts(k)[2],
         None => call_text(&CAPTION_TRAMP, MISSING_CAPTION_RVA, repo, id),
@@ -653,7 +657,7 @@ fn apply_rows(rows: &Rows) {
     let Some(file) = goods_file(repo) else { return };
     for (i, (id, want)) in rows.rows.iter().enumerate() {
         let Some(row) = (unsafe { file.get_row_by_id_mut::<EQUIP_PARAM_GOODS_ST>(*id) }) else { continue };
-        let bytes = |r: &EQUIP_PARAM_GOODS_ST| unsafe { std::slice::from_raw_parts((r as *const EQUIP_PARAM_GOODS_ST).cast::<u8>(), ROW_SIZE) }.to_vec();
+        let bytes = |r: &EQUIP_PARAM_GOODS_ST| unsafe { std::slice::from_raw_parts((r as *const EQUIP_PARAM_GOODS_ST).cast::<u8>(), ROW_SIZE) };
         if bytes(row) != bytes(want) {
             *row = want.clone();
             log::line(&format!("items: row {id} written"));
@@ -793,11 +797,19 @@ impl State {
         let link = net::link();
         let intent = net::intent();
         let connected = matches!(link, Link::HostConnected | Link::ClientConnected);
-        let no_password = settings::net().password.is_empty();
+        let cfg = settings::net();
+        let has_invite = net::pending_invite_lobby().is_some();
+        let direct_udp_join = !has_invite
+            && cfg.transport == settings::TransportSetting::Auto
+            && cfg.steam_invites
+            && !cfg.udp_host_address.trim().is_empty();
+        let invite_only = cfg.uses_steam_invites(has_invite) && !(kind == Kind::Join && direct_udp_join);
+        let no_password = cfg.password.is_empty() && !invite_only;
         match kind {
             Kind::Host | Kind::Join if no_password => None,
             Kind::Host if connected => Some("Resync the world? Both of you will rest."),
             Kind::Join if connected => None,
+            Kind::Join if invite_only && !has_invite => None,
             Kind::Host if link == Link::Hosting && intent == Some(Intent::Host) => None,
             Kind::Join if link == Link::Searching && intent == Some(Intent::Join) => None,
             Kind::Host => Some("Open your world to a companion?"),
@@ -816,8 +828,16 @@ impl State {
         let link = net::link();
         let intent = net::intent();
         let connected = matches!(link, Link::HostConnected | Link::ClientConnected);
+        let cfg = settings::net();
+        let has_invite = net::pending_invite_lobby().is_some();
+        let direct_udp_join = !has_invite
+            && cfg.transport == settings::TransportSetting::Auto
+            && cfg.steam_invites
+            && !cfg.udp_host_address.trim().is_empty();
+        let invite_only = cfg.uses_steam_invites(has_invite) && !(kind == Kind::Join && direct_udp_join);
+        let no_password = cfg.password.is_empty() && !invite_only;
         let text: String = match kind {
-            Kind::Host | Kind::Join if settings::net().password.is_empty() => {
+            Kind::Host | Kind::Join if no_password => {
                 "Set a password in sekiro_coop_settings.ini first.".into()
             }
             // Already connected: the Bell resyncs the world (both players rest), after the
@@ -834,11 +854,25 @@ impl State {
             // 3+ players (PLAN-MULTIPLAYER P4): a full world says so.
             Kind::Join if connected && let Some(t) = full_text(session_players(), crate::tuning::max_players()) => t,
             Kind::Host | Kind::Join if connected => format!("Already in co-op. Use {LEAVE_NAME} to leave first."),
-            Kind::Host if link == Link::Hosting && intent == Some(Intent::Host) => "Your world is already open.".into(),
+            Kind::Host if link == Link::Hosting && intent == Some(Intent::Host) => {
+                if invite_only {
+                    net::request_invite_overlay();
+                    "Opening Steam invite menu...".into()
+                } else {
+                    "Your world is already open.".into()
+                }
+            }
             Kind::Join if link == Link::Searching && intent == Some(Intent::Join) => "Already searching for a companion's world.".into(),
+            Kind::Join if invite_only && !has_invite => {
+                "Accept a game invite from the host in Steam to join.".into()
+            }
             Kind::Host => {
                 net::set_intent(Intent::Host);
-                "Your world is open. Waiting for a companion...".into()
+                if invite_only {
+                    "Your world is open. Use Kindred Bell again to invite friends.".into()
+                } else {
+                    "Your world is open. Waiting for a companion...".into()
+                }
             }
             Kind::Join => {
                 net::set_intent(Intent::Join);
@@ -962,6 +996,10 @@ impl State {
 
 /// Once per frame on the game thread, before the rest of the mod.
 pub fn on_frame() {
+    if let Some(lobby_id) = crate::steam::poll_invite() {
+        net::accept_steam_invite(lobby_id);
+        bossrules::notice("Steam invite accepted. Connecting to host...".into(), 5);
+    }
     // The game's own message box (dialog.rs): open / poll ours before the items read answers.
     crate::dialog::tick();
     let Ok(mut guard) = STATE.lock() else { return };

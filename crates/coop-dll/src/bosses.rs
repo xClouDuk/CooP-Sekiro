@@ -27,6 +27,11 @@ pub struct Encounter {
     pub phase_flags: &'static [u32],
     /// Scripted loss (tutorial Genichiro): no spectating.
     pub scripted_loss: bool,
+    /// True for dream/illusion-realm encounters that warp the victor out of the arena on defeat
+    /// (Folding Screen Monkeys, Divine Dragon), so spectating players follow to the victor's block
+    /// instead of returning to the pre-warp death spot.
+    #[allow(dead_code)]
+    pub no_arena_return: bool,
 }
 
 pub static ENCOUNTERS: &[Encounter] = &[
@@ -41,6 +46,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9302,
         phase_flags: &[11005802, 11005812, 11005641],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED]
     Encounter {
@@ -52,6 +58,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9301,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED]
     Encounter {
@@ -63,6 +70,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9303,
         phase_flags: &[11115803, 11115802],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] scripted loss, no HBD.
     Encounter {
@@ -74,6 +82,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 11120801,
         phase_flags: &[],
         scripted_loss: true,
+        no_arena_return: false,
     },
     // [VERIFIED] same entity, 2 phases.
     Encounter {
@@ -85,6 +94,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9308,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] ONE encounter: Emma's HBD (9315) is intermediate, Isshin Ashina's is final.
     Encounter {
@@ -96,6 +106,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9316,
         phase_flags: &[9315, 11110900],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] Genichiro's end sets 9311, 6811, 11120830 without HBD; gauge-off gap [ARV].
     Encounter {
@@ -107,6 +118,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9312,
         phase_flags: &[9311, 6811, 11120830],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED]
     Encounter {
@@ -118,6 +130,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9306,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] HBD after the headless phase. Never list 11700800: it may be set at the fake
     // death [ARV]. Helper 1700801.
@@ -130,6 +143,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9304,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] entities, [ARV] two gauges (second ape 1700852).
     Encounter {
@@ -141,6 +155,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9307,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] monkey "deaths" are captures; the gauge holder 2000800 is the last entity [ARV].
     Encounter {
@@ -152,6 +167,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9305,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: true,
     },
     // [VERIFIED]
     Encounter {
@@ -163,6 +179,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9317,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] 3 phases, same entity.
     Encounter {
@@ -174,6 +191,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9313,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] 3 lives, illusions 2500851/853/854.
     Encounter {
@@ -185,6 +203,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9309,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: false,
     },
     // [VERIFIED] scripted.
     Encounter {
@@ -196,6 +215,7 @@ pub static ENCOUNTERS: &[Encounter] = &[
         defeat_flag: 9310,
         phase_flags: &[],
         scripted_loss: false,
+        no_arena_return: true,
     },
 ];
 
@@ -378,5 +398,15 @@ mod tests {
             }
         }
         assert!(encounter_of(1120800).is_some_and(|e| e.scripted_loss));
+    }
+
+    #[test]
+    fn no_arena_return_marks_only_monkeys_and_divine_dragon() {
+        assert_eq!(encounter_of(2000800).map(|e| e.no_arena_return), Some(true));
+        assert_eq!(encounter_of(2000801).map(|e| e.no_arena_return), Some(true));
+        assert_eq!(encounter_of(2500800).map(|e| e.no_arena_return), Some(true));
+        for e_id in [1100800, 1110801, 1120860, 1100900, 1000810, 1700800, 2500850] {
+            assert_eq!(encounter_of(e_id).map(|e| e.no_arena_return), Some(false), "boss {e_id}");
+        }
     }
 }
